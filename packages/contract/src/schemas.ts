@@ -54,6 +54,7 @@ export const AccountSchema = z.object({
   id: z.string().min(1),
   provider: NativeProviderSchema,
   accountName: z.string().min(1).max(120),
+  accountEmail: z.string().nullable().default(null),
   authProfilePath: z.string().nullable(),
   isActive: z.boolean(),
   status: AccountStatusSchema,

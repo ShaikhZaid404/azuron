@@ -88,6 +88,7 @@ export class AzuronAccountVault {
       id: row.id,
       provider: row.provider,
       accountName: row.account_name,
+      accountEmail: (row as { account_email?: string | null }).account_email ?? null,
       authProfilePath: row.auth_profile_path,
       isActive: row.is_active === 1,
       status: row.status,
@@ -136,6 +137,7 @@ export class AzuronAccountVault {
       id: row.id,
       provider: row.provider,
       accountName: row.account_name,
+      accountEmail: (row as { account_email?: string | null }).account_email ?? null,
       authProfilePath: row.auth_profile_path,
       isActive: row.is_active === 1,
       status: row.status,
@@ -161,6 +163,14 @@ export class AzuronAccountVault {
     this.db
       .prepare('UPDATE accounts SET status = ?, token_usage_cached = COALESCE(?, token_usage_cached), updated_at = ? WHERE id = ?')
       .run(status, quota ? JSON.stringify(quota) : null, now, id);
+  }
+
+  public updateAccountEmail(id: string, email: string | null): Account | null {
+    const now = Date.now();
+    this.db
+      .prepare('UPDATE accounts SET account_email = ?, updated_at = ? WHERE id = ?')
+      .run(email, now, id);
+    return this.getAccount(id);
   }
 
   public deleteAccount(id: string): boolean {

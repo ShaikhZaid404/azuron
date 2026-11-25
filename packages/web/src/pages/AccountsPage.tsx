@@ -1,20 +1,28 @@
 import React, { useEffect, useState } from 'react';
-import { Check, ExternalLink, KeyRound, Plus, Trash2, UserPlus } from 'lucide-react';
+import { Check, ExternalLink, KeyRound, Mail, Plus, RefreshCw, Trash2, UserPlus } from 'lucide-react';
 import type { Account, ByokKey, ByokProvider, IntegrationStatus, NativeProvider } from '@azuron/contract';
+import { useStreamHub } from '../hub/StreamHubContext.js';
 import { apiJson } from '../lib/api.js';
 
 interface OAuthResult {
+  ok: boolean;
   accountId: string;
+  provider: NativeProvider;
   profilePath: string;
   command: string;
+  oauthUrl: string | null;
+  cliAvailable: boolean;
+  email: string | null;
   message: string;
 }
 
 export const AccountsPage: React.FC = () => {
+  const { subscribe } = useStreamHub();
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [byokKeys, setByokKeys] = useState<ByokKey[]>([]);
   const [integrations, setIntegrations] = useState<IntegrationStatus[]>([]);
   const [oauthResult, setOauthResult] = useState<OAuthResult | null>(null);
+  const [connectingId, setConnectingId] = useState<string | null>(null);
 
   const [provider, setProvider] = useState<NativeProvider>('antigravity');
   const [accountName, setAccountName] = useState('');
@@ -40,6 +48,15 @@ export const AccountsPage: React.FC = () => {
   useEffect(() => {
     void load();
   }, []);
+
+  // Auto-refresh account list when background OAuth finishes and detects email
+  useEffect(() => {
+    return subscribe((ev) => {
+      if (ev.type === 'system.log' && ev.payload?.kind === 'account.oauth') {
+        void load();
+      }
+    });
+  }, [subscribe]);
 
   const handleAddAccount = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -76,10 +93,21 @@ export const AccountsPage: React.FC = () => {
   };
 
   const handleLaunchOAuth = async (accountId: string) => {
-    const json = await apiJson<OAuthResult>(`/api/accounts/${accountId}/oauth`, {
-      method: 'POST',
-    });
-    setOauthResult(json);
+    setConnectingId(accountId);
+    try {
+      const json = await apiJson<OAuthResult>(`/api/accounts/${accountId}/oauth`, {
+        method: 'POST',
+      });
+      setOauthResult(json);
+      await load();
+    } finally {
+      setConnectingId(null);
+    }
+  };
+
+  const handleSyncEmail = async (accountId: string) => {
+    await apiJson(`/api/accounts/${accountId}/sync-email`, { method: 'POST', body: '{}' });
+    await load();
   };
 
   return (
@@ -87,7 +115,7 @@ export const AccountsPage: React.FC = () => {
       <div>
         <h1 className="text-xl font-semibold">Unified Connectors & Vault Hub</h1>
         <p className="text-xs opacity-80">
-          Manage unlimited Antigravity and Codex profiles, BYOK API keys, and GitHub/Vercel/rclone integrations
+          Connect unlimited Antigravity and Codex accounts via browser OAuth, BYOK API keys, and GitHub/Vercel/rclone integrations
         </p>
       </div>
 
@@ -128,13 +156,25 @@ export const AccountsPage: React.FC = () => {
         <div className="space-y-2">
           {accounts.map((acc) => (
             <div key={acc.id} className="p-3 rounded border flex flex-wrap items-center justify-between gap-2 text-xs" style={{ borderColor: 'var(--az-border)' }}>
-              <div>
-                <div className="font-medium">
-                  {acc.accountName} <span className="font-mono opacity-80">[{acc.provider}]</span>
+              <div className="space-y-0.5">
+                <div className="font-medium flex flex-wrap items-center gap-2">
+                  <span>{acc.accountName}</span>
+                  <span className="font-mono opacity-80">[{acc.provider}]</span>
+                  {acc.accountEmail ? (
+                    <span
+                      className="inline-flex items-center gap-1 px-2 py-0.5 rounded font-mono text-[11px]"
+                      style={{ backgroundColor: 'rgba(139,92,246,0.16)', color: 'var(--az-accent)' }}
+                    >
+                      <Mail size={11} />
+                      <span>{acc.accountEmail}</span>
+                    </span>
+                  ) : (
+                    <span className="text-[11px] opacity-60">Not linked to email yet</span>
+                  )}
                 </div>
                 <div className="font-mono opacity-75">{acc.authProfilePath}</div>
               </div>
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
                 <button
                   type="button"
                   onClick={() => void apiJson(`/api/accounts/${acc.id}/activate`, { method: 'POST' }).then(load)}
@@ -150,13 +190,23 @@ export const AccountsPage: React.FC = () => {
                 </button>
                 <button
                   type="button"
+                  disabled={connectingId === acc.id}
                   onClick={() => void handleLaunchOAuth(acc.id)}
-                  className="px-2.5 py-1 rounded border inline-flex items-center gap-1 cursor-pointer"
-                  style={{ borderColor: 'var(--az-border)' }}
-                  title="Launch OAuth to authenticate this isolated profile"
+                  className="px-2.5 py-1 rounded border inline-flex items-center gap-1 cursor-pointer disabled:opacity-50"
+                  style={{ borderColor: 'var(--az-accent)', color: 'var(--az-accent)' }}
+                  title="Generate browser OAuth link to sign in and select your account"
                 >
                   <ExternalLink size={12} />
-                  <span>Launch OAuth</span>
+                  <span>{connectingId === acc.id ? 'Generating Link...' : 'Connect Browser'}</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handleSyncEmail(acc.id)}
+                  className="p-1.5 rounded border cursor-pointer"
+                  style={{ borderColor: 'var(--az-border)' }}
+                  title="Sync connected email from profile"
+                >
+                  <RefreshCw size={13} />
                 </button>
                 <button
                   type="button"
@@ -171,21 +221,34 @@ export const AccountsPage: React.FC = () => {
           ))}
         </div>
 
-        {/* OAuth result panel */}
+        {/* Browser OAuth Link Panel */}
         {oauthResult && (
           <div
-            className="p-3 rounded border text-xs font-mono space-y-1.5"
-            style={{ borderColor: 'var(--az-accent)', backgroundColor: 'rgba(125,190,255,0.06)' }}
+            className="p-3.5 rounded border text-xs space-y-2"
+            style={{ borderColor: 'var(--az-accent)', backgroundColor: 'rgba(139,92,246,0.08)' }}
           >
-            <div className="font-semibold" style={{ color: 'var(--az-accent)' }}>[CHECK] OAuth Profile Ready</div>
-            <div>Profile: {oauthResult.profilePath}</div>
-            <div>
-              Run in terminal:&nbsp;
-              <code className="px-1 py-0.5 rounded" style={{ backgroundColor: 'var(--az-border)' }}>
-                {oauthResult.command}
-              </code>
+            <div className="font-semibold font-mono" style={{ color: 'var(--az-accent)' }}>
+              {oauthResult.oauthUrl ? '[CHECK] Browser OAuth Link Ready' : '[INFO] OAuth Profile Status'}
             </div>
-            <div className="opacity-70">{oauthResult.message}</div>
+            <div className="opacity-90">{oauthResult.message}</div>
+            {oauthResult.oauthUrl && (
+              <div className="pt-1 flex flex-wrap items-center gap-2">
+                <a
+                  href={oauthResult.oauthUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="px-3 py-1.5 rounded font-semibold inline-flex items-center gap-1.5"
+                  style={{ backgroundColor: 'var(--az-accent)', color: 'var(--az-accent-fg)' }}
+                >
+                  <ExternalLink size={13} />
+                  <span>Open Login Link in Browser</span>
+                </a>
+                <span className="font-mono text-[11px] opacity-75 break-all">{oauthResult.oauthUrl}</span>
+              </div>
+            )}
+            <div className="font-mono text-[11px] opacity-70">
+              Profile: {oauthResult.profilePath}
+            </div>
             <button
               type="button"
               onClick={() => setOauthResult(null)}

@@ -18,6 +18,7 @@ import {
 } from '@azuron/contract';
 import type { AzuronEnvironmentInspector } from '../core/environment.js';
 import type { AzuronLogger } from '../core/logger.js';
+import { launchProviderOAuth, syncAccountEmailFromProfile } from '../core/oauth.js';
 import type { AzuronPaths } from '../core/paths.js';
 import type { AzuronStreamHub } from '../core/stream-hub.js';
 import type { AzuronAccountVault } from '../core/vault.js';
@@ -485,19 +486,22 @@ export function createApiRouter(svc: AzuronServices): Hono {
     if (!account) {
       return c.json({ error: 'Account not found' }, 404);
     }
-    const bin =
-      account.provider === 'codex'
-        ? process.env.AZURON_CODEX_BIN || 'codex'
-        : process.env.AZURON_AGY_BIN || 'agy';
-    const args = account.provider === 'codex' ? ['login'] : ['auth', 'login'];
-    return c.json({
-      ok: true,
-      accountId: account.id,
-      provider: account.provider,
-      profilePath: account.authProfilePath,
-      command: `${bin} ${args.join(' ')}`,
-      message: `Isolated profile ready at ${account.authProfilePath}. Authenticate via ${bin} ${args.join(' ')} when CLI is installed.`,
-    });
+    const result = await launchProviderOAuth(account, svc.vault, svc.hub);
+    return c.json(result);
+  });
+
+  api.post('/accounts/:id/sync-email', async (c) => {
+    const account = svc.vault.getAccount(c.req.param('id'));
+    if (!account) {
+      return c.json({ error: 'Account not found' }, 404);
+    }
+    const body = (await c.req.json().catch(() => ({}))) as { email?: string };
+    if (body.email && body.email.includes('@')) {
+      const updated = svc.vault.updateAccountEmail(account.id, body.email.trim());
+      return c.json({ account: updated });
+    }
+    syncAccountEmailFromProfile(account, svc.vault);
+    return c.json({ account: svc.vault.getAccount(account.id) });
   });
 
   // Phase 2: Task Worktree Prepare & Review Gate

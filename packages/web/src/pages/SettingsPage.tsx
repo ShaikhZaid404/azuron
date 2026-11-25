@@ -41,7 +41,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ theme, onToggleTheme
         <div>
           <div className="text-sm font-semibold">Theme Mode ({theme.toUpperCase()})</div>
           <div className="text-xs opacity-80">
-            Dark: #0D0D0D / #FFFFFF / #7DBEFF / #2B2B2B | Light: #FFFFFF / #0D0D0D / #7DBEFF / #E5E7EB
+            Dark: #0D0D0D / #FFFFFF / #8B5CF6 / #2B2B2B | Light: #FFFFFF / #0D0D0D / #8B5CF6 / #E5E7EB
           </div>
         </div>
         <button

@@ -337,4 +337,20 @@ describe('AZURON Core Backend & Persistence Suite', () => {
     assert.equal(typeof json.profilePath, 'string');
     assert.match(json.command, /agy/);
   });
+
+  it('POST /api/accounts/:id/sync-email extracts connected email from isolated profile JSON', async () => {
+    const acct = ctx.services.vault.createAccount('codex', 'Codex Email Sync');
+    fs.writeFileSync(
+      path.join(acct.authProfilePath!, 'auth.json'),
+      JSON.stringify({ email: 'zaid.dev@example.com' }),
+    );
+    const res = await ctx.app.request(`/api/accounts/${acct.id}/sync-email`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    assert.equal(res.status, 200);
+    const json = (await res.json()) as { account: { accountEmail: string } };
+    assert.equal(json.account.accountEmail, 'zaid.dev@example.com');
+  });
 });

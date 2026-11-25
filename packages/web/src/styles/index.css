@@ -4,17 +4,17 @@
 [data-theme="dark"] {
   --az-bg: #0D0D0D;
   --az-fg: #FFFFFF;
-  --az-accent: #7DBEFF;
+  --az-accent: #8B5CF6;
   --az-border: #2B2B2B;
-  --az-accent-fg: #0D0D0D;
+  --az-accent-fg: #FFFFFF;
 }
 
 [data-theme="light"] {
   --az-bg: #FFFFFF;
   --az-fg: #0D0D0D;
-  --az-accent: #7DBEFF;
+  --az-accent: #8B5CF6;
   --az-border: #E5E7EB;
-  --az-accent-fg: #0D0D0D;
+  --az-accent-fg: #FFFFFF;
 }
 
 * {

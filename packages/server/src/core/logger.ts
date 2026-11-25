@@ -35,18 +35,18 @@ export class AzuronLogger {
   public banner(lines: string[]): void {
     const width = Math.max(...lines.map((l) => l.length), 48) + 4;
     const border = '+' + '-'.repeat(width) + '+';
-    console.log(chalk.hex('#7DBEFF')(border));
+    console.log(chalk.hex('#8B5CF6')(border));
     for (const content of lines) {
       const padded = content.padEnd(width - 2, ' ');
-      console.log(`${chalk.hex('#7DBEFF')('|')} ${chalk.white(padded)} ${chalk.hex('#7DBEFF')('|')}`);
+      console.log(`${chalk.hex('#8B5CF6')('|')} ${chalk.white(padded)} ${chalk.hex('#8B5CF6')('|')}`);
     }
-    console.log(chalk.hex('#7DBEFF')(border));
+    console.log(chalk.hex('#8B5CF6')(border));
   }
 
   private formatTag(tag: LogTag): string {
     switch (tag) {
       case 'START':
-        return chalk.hex('#7DBEFF').bold('[START]');
+        return chalk.hex('#8B5CF6').bold('[START]');
       case 'CHECK':
         return chalk.green.bold('[CHECK]');
       case 'TURN':

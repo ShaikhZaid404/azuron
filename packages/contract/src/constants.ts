@@ -29,13 +29,13 @@ export const AZURON_THEME_TOKENS = {
   dark: {
     background: '#0D0D0D', // 70%
     foreground: '#FFFFFF', // 20%
-    accent: '#7DBEFF',     // 8%
+    accent: '#8B5CF6',     // 8%
     border: '#2B2B2B',     // 2%
   },
   light: {
     background: '#FFFFFF', // 70%
     foreground: '#0D0D0D', // 20%
-    accent: '#7DBEFF',     // 8%
+    accent: '#8B5CF6',     // 8%
     border: '#E5E7EB',     // 2%
   },
 } as const;

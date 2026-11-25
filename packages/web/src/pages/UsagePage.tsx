@@ -136,7 +136,7 @@ export const UsagePage: React.FC = () => {
                   className="w-5 h-5 rounded border cursor-pointer"
                   style={{
                     borderColor: 'var(--az-border)',
-                    backgroundColor: '#7DBEFF',
+                    backgroundColor: '#8B5CF6',
                     opacity: intensity,
                     minHeight: '20px',
                   }}

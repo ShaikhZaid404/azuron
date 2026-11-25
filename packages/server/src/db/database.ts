@@ -19,6 +19,7 @@ function applySchema(db: DatabaseSync): void {
       id TEXT PRIMARY KEY,
       provider TEXT NOT NULL CHECK(provider IN ('antigravity', 'codex')),
       account_name TEXT NOT NULL,
+      account_email TEXT,
       auth_profile_path TEXT,
       encrypted_credentials TEXT,
       is_active INTEGER NOT NULL DEFAULT 0,
@@ -159,6 +160,11 @@ function applySchema(db: DatabaseSync): void {
     );
     CREATE INDEX IF NOT EXISTS idx_stream_events_created ON stream_events(created_at DESC);
   `);
+
+  const cols = db.prepare('PRAGMA table_info(accounts)').all() as Array<{ name: string }>;
+  if (!cols.some((c) => c.name === 'account_email')) {
+    db.exec('ALTER TABLE accounts ADD COLUMN account_email TEXT;');
+  }
 }
 
 function seedRetentionPolicies(db: DatabaseSync): void {
