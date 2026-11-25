@@ -59,27 +59,19 @@ command -v npm >/dev/null 2>&1 || err "npm not found. Install with: pkg install 
 ok "npm found"
 
 # ---- npm install + build -------------------------------------------------------
-FORCE_INSTALL=0
-if [ "$1" = "--force" ] || [ "$1" = "-f" ]; then
-  FORCE_INSTALL=1
+SKIP_BUILD=0
+if [ "$1" = "--skip-build" ]; then
+  SKIP_BUILD=1
 fi
 
 cd "$REPO_DIR"
 
-if [ "$FORCE_INSTALL" = "0" ] && [ -d "$REPO_DIR/node_modules" ]; then
-  ok "Dependencies already installed (skipping npm install; use --force to reinstall)"
-else
-  log "Installing npm dependencies..."
-  if [ "$IS_TERMUX" = "1" ]; then
-    node "$REPO_DIR/node_modules/.bin/npm" install 2>/dev/null || npm install
-  else
-    npm install
-  fi
-  ok "Dependencies installed"
-fi
+log "Installing and verifying npm workspace dependencies..."
+npm install
+ok "Dependencies and workspace symlinks verified"
 
-if [ "$FORCE_INSTALL" = "0" ] && [ -f "$REPO_DIR/packages/cezar/dist/index.js" ] && [ -f "$REPO_DIR/packages/cezar/web/dist/index.html" ]; then
-  ok "Build already exists (skipping npm run build; use --force to rebuild)"
+if [ "$SKIP_BUILD" = "1" ]; then
+  ok "Build already completed by updater"
 else
   log "Building all packages (server + web)..."
   npm run build

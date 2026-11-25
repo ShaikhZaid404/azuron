@@ -130,6 +130,9 @@ function cmdDoctor() {
     const status = r.status === 0 ? `Found (${r.stdout.trim()})` : 'Not found';
     console.log(`[CHECK] CLI ${bin.padEnd(14, ' ')}: ${status}`);
   }
+  const contractLink = path.join(rootDir, 'node_modules', '@open-mercato', 'cezar-contract');
+  const contractOk = fs.existsSync(contractLink);
+  console.log(`[CHECK] Workspace links   : ${contractOk ? 'Verified' : 'Missing (run: npm install)'}`);
   if (fs.existsSync(LOG_PATH)) {
     const tail = fs.readFileSync(LOG_PATH, 'utf8').trim().split('\n').slice(-5);
     console.log('[INFO] Recent azuron.log entries:');
@@ -165,7 +168,17 @@ function cmdUpdate() {
     console.error('[ERROR] git pull failed. Check your internet connection or local changes.');
     process.exit(pull.status ?? 1);
   }
-  console.log('[START] Building updated packages...');
+  console.log('[START] Installing/linking workspace dependencies...');
+  const npmInstall = spawnSync('npm', ['install'], {
+    stdio: 'inherit',
+    cwd: rootDir,
+    env,
+  });
+  if (npmInstall.status !== 0) {
+    console.error('[ERROR] npm install failed during update.');
+    process.exit(npmInstall.status ?? 1);
+  }
+  console.log('[START] Building updated packages (server + web)...');
   const build = spawnSync('npm', ['run', 'build'], {
     stdio: 'inherit',
     cwd: rootDir,
@@ -175,8 +188,8 @@ function cmdUpdate() {
     console.error('[ERROR] npm run build failed during update.');
     process.exit(build.status ?? 1);
   }
-  console.log('[START] Re-linking AZURON...');
-  const install = spawnSync('sh', [path.join(rootDir, 'install.sh')], {
+  console.log('[START] Re-linking AZURON command...');
+  const install = spawnSync('sh', [path.join(rootDir, 'install.sh'), '--skip-build'], {
     stdio: 'inherit',
     cwd: rootDir,
     env,
