@@ -59,21 +59,32 @@ command -v npm >/dev/null 2>&1 || err "npm not found. Install with: pkg install 
 ok "npm found"
 
 # ---- npm install + build -------------------------------------------------------
-log "Installing npm dependencies..."
+FORCE_INSTALL=0
+if [ "$1" = "--force" ] || [ "$1" = "-f" ]; then
+  FORCE_INSTALL=1
+fi
+
 cd "$REPO_DIR"
 
-if [ "$IS_TERMUX" = "1" ]; then
-  # Android: scripts must be called with explicit interpreter; npm workspace
-  # builds already handle this via node ../../node_modules/.../tsc pattern
-  node "$REPO_DIR/node_modules/.bin/npm" install 2>/dev/null || npm install
+if [ "$FORCE_INSTALL" = "0" ] && [ -d "$REPO_DIR/node_modules" ]; then
+  ok "Dependencies already installed (skipping npm install; use --force to reinstall)"
 else
-  npm install
+  log "Installing npm dependencies..."
+  if [ "$IS_TERMUX" = "1" ]; then
+    node "$REPO_DIR/node_modules/.bin/npm" install 2>/dev/null || npm install
+  else
+    npm install
+  fi
+  ok "Dependencies installed"
 fi
-ok "Dependencies installed"
 
-log "Building all packages (contract → server → web)..."
-npm run build
-ok "Build complete"
+if [ "$FORCE_INSTALL" = "0" ] && [ -f "$REPO_DIR/packages/contract/dist/index.js" ] && [ -f "$REPO_DIR/packages/server/dist/index.js" ] && [ -f "$REPO_DIR/packages/web/dist/index.html" ]; then
+  ok "Build already exists (skipping npm run build; use --force to rebuild)"
+else
+  log "Building all packages (contract → server → web)..."
+  npm run build
+  ok "Build complete"
+fi
 
 # ---- Create ~/.azuron directory structure -------------------------------------
 log "Creating AZURON data directories under $AZURON_HOME ..."
