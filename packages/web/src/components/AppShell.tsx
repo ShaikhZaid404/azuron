@@ -181,7 +181,15 @@ export const AppShell: React.FC<AppShellProps> = ({
           </div>
         </header>
 
-        <main className="flex-1 overflow-y-auto p-3 md:p-6 pb-24 md:pb-6">{children}</main>
+        <main
+          className={
+            route === 'chat'
+              ? 'flex-1 min-w-0 h-full overflow-hidden flex flex-col pb-14 md:pb-0'
+              : 'flex-1 overflow-y-auto p-3 md:p-6 pb-24 md:pb-6'
+          }
+        >
+          {children}
+        </main>
 
         {/* Global Floating In-Flight Mini-Runner Bar (Zero-Loss Navigation) */}
         {activeRuns.length > 0 && (
