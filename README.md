@@ -104,15 +104,19 @@ azuron start
 
 ## CLI Commands
 
-```bash
-azuron start                    # Start the AZURON server (port 45160)
-azuron stop                     # Stop the running server
-azuron restart                  # Restart server
-azuron status                   # Show PID, uptime, port
-azuron doctor                   # Environment diagnostic (Node, git, agy, codex, rclone)
-azuron storage clean --dry-run  # Preview storage cleanup (does not delete)
-azuron storage clean            # Apply cleanup (respects pinned/protected items)
-```
+| Command | Description |
+|---------|-------------|
+| `azuron start` | Start the AZURON server on `127.0.0.1:45160` (auto-fallbacks to next free port if busy) |
+| `azuron stop` | Stop the running AZURON server |
+| `azuron restart` | Stop and restart the AZURON server |
+| `azuron status` | Show PID, uptime, RAM usage, and dashboard URL |
+| `azuron update` | Pull latest changes from GitHub, rebuild all packages, and re-link global command |
+| `azuron open` | Open the AZURON dashboard in your default browser |
+| `azuron doctor` | Diagnose Node.js, Termux/Android environment, and installed CLIs (`git`, `gh`, `agy`, `codex`, `rclone`) |
+| `azuron storage clean --dry-run` | Preview storage cleanup without deleting any files |
+| `azuron storage clean` | Apply retention cleanup (respects pinned/protected items) |
+| `azuron version` | Show installed AZURON version (`v0.1`) |
+| `azuron help` | Show CLI usage help |
 
 ---
 

@@ -145,7 +145,17 @@ function cmdUpdate() {
     console.error('[ERROR] git pull failed. Check your internet connection or local changes.');
     process.exit(pull.status ?? 1);
   }
-  console.log('[START] Rebuilding and re-linking AZURON...');
+  console.log('[START] Building updated packages...');
+  const build = spawnSync('npm', ['run', 'build'], {
+    stdio: 'inherit',
+    cwd: rootDir,
+    env,
+  });
+  if (build.status !== 0) {
+    console.error('[ERROR] npm run build failed during update.');
+    process.exit(build.status ?? 1);
+  }
+  console.log('[START] Re-linking AZURON...');
   const install = spawnSync('sh', [path.join(rootDir, 'install.sh')], {
     stdio: 'inherit',
     cwd: rootDir,
