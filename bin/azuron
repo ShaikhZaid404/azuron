@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
+const VERSION = 'v0.1';
 const AZURON_HOME = process.env.AZURON_HOME || path.join(os.homedir(), '.azuron');
 const PID_PATH = path.join(AZURON_HOME, 'azuron.pid');
 const LOG_PATH = path.join(AZURON_HOME, 'logs', 'azuron.log');
@@ -26,10 +27,24 @@ function getRunningPid() {
   }
 }
 
-function cmdStart() {
+async function isPortInUse() {
+  try {
+    const res = await fetch(`${URL}/api/health`, { signal: AbortSignal.timeout(800) });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+async function cmdStart() {
   const existing = getRunningPid();
   if (existing) {
-    console.log(`[INFO] AZURON is already running (PID ${existing}) at ${URL}`);
+    console.log(`[INFO] AZURON ${VERSION} is already running (PID ${existing}) at ${URL}`);
+    return;
+  }
+  if (await isPortInUse()) {
+    console.log(`[INFO] AZURON ${VERSION} is already running at ${URL} (port ${PORT} active).`);
+    console.log('[INFO] Use "azuron restart" to restart or "azuron status" to inspect.');
     return;
   }
   const entry = fs.existsSync(serverEntry) ? serverEntry : serverTsEntry;
@@ -124,40 +139,74 @@ async function cmdStorageClean(args) {
   }
 }
 
+function cmdUpdate() {
+  console.log(`[START] Updating AZURON (${VERSION}) from GitHub...`);
+  const env = { ...process.env, GIT_CONFIG_NOSYSTEM: '1' };
+  const pull = spawnSync('git', ['-C', rootDir, 'pull', 'origin', 'main'], {
+    stdio: 'inherit',
+    env,
+  });
+  if (pull.status !== 0) {
+    console.error('[ERROR] git pull failed. Check your internet connection or local changes.');
+    process.exit(pull.status ?? 1);
+  }
+  console.log('[START] Rebuilding and re-linking AZURON...');
+  const install = spawnSync('sh', [path.join(rootDir, 'install.sh')], {
+    stdio: 'inherit',
+    cwd: rootDir,
+    env,
+  });
+  if (install.status !== 0) {
+    console.error('[ERROR] install.sh failed during update.');
+    process.exit(install.status ?? 1);
+  }
+  console.log('[CHECK] AZURON updated successfully. Run "azuron restart" if server is running.');
+}
+
 function cmdHelp() {
-  console.log('AZURON CLI (Local-First AI Coding Agent Workspace)');
+  console.log(`AZURON CLI ${VERSION} (Local-First AI Coding Agent Workspace)`);
   console.log('');
   console.log('Usage: azuron <command>');
   console.log('  start                  Start AZURON daemon on 127.0.0.1:45160');
   console.log('  stop                   Stop running AZURON daemon');
   console.log('  restart                Restart AZURON daemon');
   console.log('  status                 Inspect daemon health and RAM footprint');
+  console.log('  update                 Pull latest files from GitHub & rebuild');
   console.log('  open                   Open dashboard in browser');
   console.log('  doctor                 Diagnose Node, Termux, SQLite, and CLIs');
   console.log('  storage clean          Run retention sweep (--dry-run, --silent)');
+  console.log('  version                Show AZURON version');
   console.log('  help                   Show this help');
 }
 
 const [, , sub = 'start', ...rest] = process.argv;
 switch (sub) {
   case 'start':
-    cmdStart();
+    await cmdStart();
     break;
   case 'stop':
     cmdStop();
     break;
   case 'restart':
     cmdStop();
-    setTimeout(cmdStart, 500);
+    setTimeout(() => void cmdStart(), 500);
     break;
   case 'status':
     await cmdStatus();
+    break;
+  case 'update':
+    cmdUpdate();
     break;
   case 'open':
     cmdOpen();
     break;
   case 'doctor':
     cmdDoctor();
+    break;
+  case 'version':
+  case '--version':
+  case '-v':
+    console.log(`AZURON ${VERSION}`);
     break;
   case 'storage':
     if (rest[0] === 'clean') {
