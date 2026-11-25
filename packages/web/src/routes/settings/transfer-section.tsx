@@ -156,7 +156,7 @@ function previewInput(bundle: ConfigBundle, choices: Choices): ConfigBundlePrevi
 
 function HostedNotice() {
   return (
-    <SettingsCard id="import" title="Import" description="Apply a configuration bundle exported from another cezar.">
+    <SettingsCard id="import" title="Import" description="Apply a configuration bundle exported from another AZURON.">
       <CardNote slot="transfer-import-hosted">Import is only available on a local cockpit.</CardNote>
     </SettingsCard>
   )
@@ -227,7 +227,7 @@ function ImportPanel({ localHandoff }: { localHandoff: boolean }) {
     <SettingsCard
       id="import"
       title="Import"
-      description="Apply a configuration bundle exported from another cezar. Nothing is written until you apply, and automations always land paused."
+      description="Apply a configuration bundle exported from another AZURON. Nothing is written until you apply, and automations always land paused."
     >
       <div data-slot="transfer-import" className="contents">
         <FormRow

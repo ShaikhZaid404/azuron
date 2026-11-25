@@ -164,7 +164,7 @@ export function ThisPhoneNotificationsCard() {
       {editor.value ? (
         <PhoneNotificationsForm value={editor.value} onChange={editor.change} saved={editor.saved} idPrefix="this-phone" />
       ) : (
-        <CardNote>{query.isError ? 'This computer runs an older cezar: update it to choose what this phone hears.' : 'Loading…'}</CardNote>
+        <CardNote>{query.isError ? 'This computer runs an older AZURON: update it to choose what this phone hears.' : 'Loading…'}</CardNote>
       )}
     </SettingsCard>
   )

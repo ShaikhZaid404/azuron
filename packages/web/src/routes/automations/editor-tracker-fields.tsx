@@ -116,7 +116,7 @@ export function EditorTrackerFields({ trigger, intervalSeconds, onChange, onVali
       {!trigger.access ? <div role="alert">This automation previously gave its agent a tracker token. Review the prompt: only reading this issue, comments and status transitions are now supported. Other operations need a revised workflow.
         <Button type="button" variant="outline" onClick={() => onChange({ trackerTrigger: { ...trigger, access: { version: 1, writes: [] } } })}>Confirm migration to read-only access</Button>
       </div> : <>
-        <p>Fresh issue details and accessible comments are read by cezar. Attachments and custom fields are not included. Tokens stay with cezar.</p>
+        <p>Fresh issue details and accessible comments are read by AZURON. Attachments and custom fields are not included. Tokens stay with AZURON.</p>
         {(['comment', 'transition'] as const).map(operation => <label key={operation} className="flex gap-2"><input type="checkbox" checked={trigger.access!.writes.includes(operation)} onChange={e => onChange({ trackerTrigger: { ...trigger, access: { version: 1, writes: e.target.checked ? [...trigger.access!.writes, operation] : trigger.access!.writes.filter(value => value !== operation) } } })} />Allow agent to {operation === 'comment' ? 'post comments' : 'change status'} on this issue without further approval</label>)}
       </>}
     </fieldset> : null}

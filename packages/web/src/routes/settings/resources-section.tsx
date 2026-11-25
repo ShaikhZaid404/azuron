@@ -242,7 +242,7 @@ function ResourcesForm({ config }: { config: WorkspaceConfigResponse }) {
           saved={savedFor('autoResumeOnUsageLimit')}
           htmlFor="resources-auto-resume"
           label="Auto-resume after a usage limit"
-          description="When an agent stops because its provider usage limit is reached, cezar waits for the reset the provider named and continues the task 30 seconds later — up to 12 times in a row without you. Off leaves the task failed with its Continue button. Applies to Claude, Codex and OpenCode."
+          description="When an agent stops because its provider usage limit is reached, AZURON waits for the reset the provider named and continues the task 30 seconds later — up to 12 times in a row without you. Off leaves the task failed with its Continue button. Applies to Claude, Codex and OpenCode."
         >
           <Switch
             id="resources-auto-resume"
@@ -289,7 +289,7 @@ function ResourcesForm({ config }: { config: WorkspaceConfigResponse }) {
         <FormRow
           saved={savedFor('minFreePercent')}
           label="Disk guard: minimum free space"
-          description="When free space on the worktrees' disk drops below the smaller of these two, cezar reclaims the oldest idle worktrees across every project until it is back above, and warns you when that is not enough. Running tasks are never touched. 0 turns a trigger off."
+          description="When free space on the worktrees' disk drops below the smaller of these two, AZURON reclaims the oldest idle worktrees across every project until it is back above, and warns you when that is not enough. Running tasks are never touched. 0 turns a trigger off."
         >
           <IntegerStepper
             aria-label="Disk guard minimum free percent"

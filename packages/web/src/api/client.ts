@@ -2770,7 +2770,7 @@ export async function getWorkspaceConfig(opts?: ReadOptions): Promise<WorkspaceC
     // cleanly to its built-in identity instead of failing during shell render.
     branding: answer.branding
       ? { ...answer.branding, logoUrl: answer.branding.logoUrl ? resolveApiUrl(answer.branding.logoUrl) : null }
-      : { name: 'cezar', logoUrl: null },
+      : { name: 'AZURON', logoUrl: null },
     agentDefaults: answer.agentDefaults ?? {},
     // Additive key: an older server omits it.
     orgSkillsRepos: answer.orgSkillsRepos ?? [],

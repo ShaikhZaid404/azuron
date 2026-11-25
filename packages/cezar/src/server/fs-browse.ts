@@ -80,7 +80,7 @@ const MAX_ENTRIES = 1000;
 export const PRIVACY_PROTECTED_HOME_DIRS = new Set(['Desktop', 'Documents', 'Downloads', 'Library', 'Movies', 'Music', 'Pictures']);
 
 /** The 403 a macOS privacy denial answers with; the picker offers System Settings beside it. */
-export const MACOS_PRIVACY_BLOCKED = 'macOS privacy settings do not allow cezar to read this folder.';
+export const MACOS_PRIVACY_BLOCKED = 'macOS privacy settings do not allow AZURON to read this folder.';
 
 /**
  * Expand the configured browse root. The workspace owns this independently

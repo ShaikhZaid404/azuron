@@ -33,20 +33,13 @@ export const BRAND_LOCKUP = { mark: 26, name: 19, gap: 11.4 } as const
 
 export function BrandMark({ height = BRAND_LOCKUP.mark, className }: { height?: number; className?: string }) {
   return (
-    <svg
+    <img
       data-slot="brand-mark"
-      aria-hidden="true"
-      focusable="false"
-      viewBox={`${MARK_BOX.x} ${MARK_BOX.y} ${MARK_BOX.width} ${MARK_BOX.height}`}
-      height={height}
-      width={(height * MARK_BOX.width) / MARK_BOX.height}
-      fill="currentColor"
-      className={cn('shrink-0', className)}
-    >
-      {BRAND_MARK_POLYGONS.map((points) => (
-        <polygon key={points} points={points} />
-      ))}
-    </svg>
+      src="/brand/azuron-logo.webp"
+      alt="AZURON"
+      style={{ height, width: height }}
+      className={cn('shrink-0 rounded-md object-contain', className)}
+    />
   )
 }
 
@@ -58,7 +51,12 @@ export function BrandLockup({ className, name = 'AZURON', logoUrl = '/brand/azur
       className={cn('flex min-w-0 items-center text-foreground', className)}
       style={{ gap: BRAND_LOCKUP.gap }}
     >
-      {logoUrl ? <img data-slot="brand-logo" src={logoUrl} alt="AZURON" className="size-[26px] shrink-0 object-contain rounded-md" /> : <BrandMark />}
+      <img
+        data-slot="brand-logo"
+        src={logoUrl || '/brand/azuron-logo.webp'}
+        alt={name}
+        className="size-[26px] shrink-0 object-contain rounded-md"
+      />
       <span
         data-slot="brand-name"
         className={cn('max-w-full truncate leading-none font-semibold tracking-normal uppercase text-foreground')}

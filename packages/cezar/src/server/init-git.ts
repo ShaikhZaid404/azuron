@@ -99,12 +99,12 @@ export async function initGitInFolder(opts: {
 function unsafeRoot(root: string, home: string): string | null {
   const target = resolve(root);
   const homeDir = resolve(home);
-  if (target === parse(target).root) return 'cezar will not make a whole disk a git repository. Pick a project folder instead.';
+  if (target === parse(target).root) return 'AZURON will not make a whole disk a git repository. Pick a project folder instead.';
   if (target === homeDir || homeDir.startsWith(`${target}/`)) {
-    return 'cezar will not make your home folder a git repository. Pick a project folder instead.';
+    return 'AZURON will not make your home folder a git repository. Pick a project folder instead.';
   }
   if (dirname(target) === homeDir && PRIVACY_PROTECTED_HOME_DIRS.has(target.slice(homeDir.length + 1))) {
-    return `cezar will not make your ${target.slice(homeDir.length + 1)} folder a git repository. Pick a project folder inside it instead.`;
+    return `AZURON will not make your ${target.slice(homeDir.length + 1)} folder a git repository. Pick a project folder inside it instead.`;
   }
   return null;
 }

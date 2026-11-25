@@ -847,7 +847,7 @@ function SetUpAgentHere({ setup }: { setup: Extract<AgentSetupState, { available
       title={agentSetupHeading(setup, providers.data)}
       slot="sign-in"
       step="agent"
-      why="cezar installs the coding agent and signs you in, right here. No API key needed."
+      why="AZURON installs the coding agent and signs you in, right here. No API key needed."
     >
       {nothingToOffer ? (
         <div data-slot="agents-off" className="mt-7 flex w-full flex-col gap-3 rounded-xl border border-border bg-card p-4 text-left sm:flex-row sm:items-center sm:justify-between">
@@ -919,7 +919,7 @@ function SignInToAgent() {
     )
   }
   return (
-    <Page title="Sign in to an agent" slot="sign-in" step="agent" why="cezar runs the coding agent you already use. No API key needed.">
+    <Page title="Sign in to an agent" slot="sign-in" step="agent" why="AZURON runs the coding agent you already use. No API key needed.">
       <div className="mt-7 flex w-full flex-col gap-3 text-left">
         {/* Every agent switched off leaves no row to sign in to: say so, and where to turn one on. */}
         {rows.length === 0 ? (
@@ -966,7 +966,7 @@ function SignInToAgent() {
                         <CommandBox command={row.command} />
                       </div>
                     </li>
-                    <li>Come back. cezar checks by itself.</li>
+                    <li>Come back. AZURON checks by itself.</li>
                   </Steps>
                 </div>
               ) : null}
@@ -985,7 +985,7 @@ function SignInToAgent() {
                         <CommandBox command={row.login} />
                       </div>
                     </li>
-                    <li>Come back. cezar checks by itself.</li>
+                    <li>Come back. AZURON checks by itself.</li>
                   </Steps>
                   <p className="text-label text-soft-foreground">
                     Needs Node.js.{' '}
@@ -1284,7 +1284,7 @@ function InitGitDialog({ folder, onOpenChange }: { folder: string; onOpenChange:
   return (
     <OnboardingDialog
       title={`Initialize git in ${folder}`}
-      description="Git keeps a history of your files. cezar runs this for you and uploads nothing. node_modules and .env files stay out."
+      description="Git keeps a history of your files. AZURON runs this for you and uploads nothing. node_modules and .env files stay out."
       onOpenChange={onOpenChange}
       onSubmit={initialize}
       footer={
@@ -1491,7 +1491,7 @@ export function WhatsNewNavItem({ menuItem = false }: { menuItem?: boolean } = {
           {label}
         </button>
       )}
-      {open ? <WhatsNewDialog items={items} description="Recent changes in cezar." onOpenChange={setOpen} /> : null}
+      {open ? <WhatsNewDialog items={items} description="Recent changes in AZURON." onOpenChange={setOpen} /> : null}
     </>
   )
 }

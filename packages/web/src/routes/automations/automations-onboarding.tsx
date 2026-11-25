@@ -29,7 +29,7 @@ export function AutomationsOnboarding({ data }: { data: AutomationsResponse }) {
       wide
       slot="automations"
       title="Let the routine run itself"
-      why="An automation is a prompt cezar turns into a task on its own: at a time you set, when something happens on GitHub, or when an issue moves in Jira or Linear."
+      why="An automation is a prompt AZURON turns into a task on its own: at a time you set, when something happens on GitHub, or when an issue moves in Jira or Linear."
     >
       <div data-slot="automation-triggers" className="mt-8 grid w-full gap-3 sm:grid-cols-3">
         <ChoiceTile

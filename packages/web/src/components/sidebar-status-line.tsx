@@ -270,11 +270,11 @@ function MoreMenu({
               href={CEZAR_REPO_URL}
               target="_blank"
               rel="noopener noreferrer"
-              title={`Star cezar on GitHub — ${starCount.toLocaleString()} stars`}
-              aria-label={`Star cezar on GitHub — ${starCount.toLocaleString()} stars`}
+              title={`Star AZURON on GitHub — ${starCount.toLocaleString()} stars`}
+              aria-label={`Star AZURON on GitHub — ${starCount.toLocaleString()} stars`}
             >
               <StarIcon aria-hidden="true" />
-              <span className="min-w-0 flex-1 truncate">Star cezar on GitHub</span>
+              <span className="min-w-0 flex-1 truncate">Star AZURON on GitHub</span>
               <span className="shrink-0 text-label text-soft-foreground tabular-nums">{formatStarCount(starCount)}</span>
             </a>
           </DropdownMenuItem>

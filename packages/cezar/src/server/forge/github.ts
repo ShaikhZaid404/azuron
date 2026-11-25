@@ -3076,7 +3076,7 @@ export function buildPrBody(handoffText: string, task: string): string {
     .join('\n');
   const parts = ['## Goal', '', goal];
   if (progress) parts.push('', '## Progress log', '', progress);
-  parts.push('', '---', '', '🤖 made with cezar');
+  parts.push('', '---', '', 'Created with AZURON');
   return parts.join('\n');
 }
 

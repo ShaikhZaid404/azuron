@@ -621,7 +621,7 @@ function ActivityNotice({ at, activity }: { at: string; activity: ManagerActivit
           {count(activity.checksSkipped, 'check')}{activity.checksSkipped !== undefined ? ' skipped' : null}
           {count(activity.jobRunsSkipped, 'job run')}{activity.jobRunsSkipped !== undefined ? ' skipped' : null}
           {activity.catchUp ? <span>catching up now</span> : null}
-          <span className="text-muted-foreground">{activity.catchUp ? 'summary posted by cezar · the catch-up check is one model call' : 'posted by cezar · no model call'}</span>
+          <span className="text-muted-foreground">{activity.catchUp ? 'summary posted by AZURON · the catch-up check is one model call' : 'posted by AZURON · no model call'}</span>
         </div>
       ) : null}
     </div>

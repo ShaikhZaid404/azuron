@@ -97,7 +97,7 @@ export function ProjectGeneral({ capabilities }: { capabilities?: Partial<Pick<C
         {project.unregistered ? (
           <FormRow
             label="Add to your projects"
-            description="cezar is serving this folder because you started it here — starting cezar somewhere new never adds it to your project list for you. Adding it keeps it in the sidebar between runs and gives it a registry entry to hold settings like the task cap. Nothing on disk changes either way."
+            description="AZURON is serving this folder because you started it here — starting AZURON somewhere new never adds it to your project list for you. Adding it keeps it in the sidebar between runs and gives it a registry entry to hold settings like the task cap. Nothing on disk changes either way."
           >
             <AddBootProjectButton root={project.root} name={project.name} notAddable={project.notAddable === true} />
           </FormRow>
@@ -137,7 +137,7 @@ export function ProjectGeneral({ capabilities }: { capabilities?: Partial<Pick<C
   )
 }
 
-/** The registry entry, read out: what cezar probed about this folder the last time it looked.
+/** The registry entry, read out: what AZURON probed about this folder the last time it looked.
  *  `canRemove` is whether the Remove field is rendered below — the missing-folder hint points at
  *  it, and must not point at a field single-project mode took away. */
 function ProjectFacts({ project, canRemove }: { project: ProjectListEntry; canRemove: boolean }) {
@@ -145,7 +145,7 @@ function ProjectFacts({ project, canRemove }: { project: ProjectListEntry; canRe
     <FormRow
       stacked
       label="Registry entry"
-      description="What cezar knows about this checkout — re-probed every time the project list is read."
+      description="What AZURON knows about this checkout — re-probed every time the project list is read."
     >
       <dl
         data-slot="project-facts"

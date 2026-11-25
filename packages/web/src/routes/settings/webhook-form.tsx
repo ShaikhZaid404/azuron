@@ -64,7 +64,7 @@ export function WebhookForm({ receiver, draft, setDraft, pending, blocked = fals
       {format === 'discord.v1' && <p className={hintStyle}>In Discord, open Server Settings → Integrations → Webhooks, create one and paste its URL. <a className="underline underline-offset-2 hover:text-foreground" href="https://support.discord.com/hc/en-us/articles/228383668-Intro-to-Webhooks" target="_blank" rel="noreferrer">Discord setup guide</a></p>}
       {chat ? <p className={hintStyle}>Keep this URL secret — anyone who has it can post to the channel. {destinationName} receivers need no signing key.</p> : <>
         <label className="flex items-start gap-2 text-ui"><input type="checkbox" className="mt-0.5" checked={local} onChange={event => change('local', event.target.checked)} />Allow a receiver on this computer or private network</label>
-        {local && <p className={hintStyle}>Tests will contact this private address. Hosted cezar sends to public HTTPS receivers only.</p>}
+        {local && <p className={hintStyle}>Tests will contact this private address. Hosted AZURON sends to public HTTPS receivers only.</p>}
         <a className="text-label text-muted-foreground underline underline-offset-2 hover:text-foreground" href={`${guideHref}#external-automation-receivers`} target="_blank" rel="noreferrer">How to build a receiver</a>
       </>}
     </Field>
@@ -115,7 +115,7 @@ function ChatPreview({ format, profile }: { format: WebhookDraft['format']; prof
       <p>running → waiting</p>
       <p className="text-label text-muted-foreground">example-project · a1b2c3d4 · Jan 1, 2026, 12:00 UTC</p>
       {profile === 'standard' && <div><p>Which example option should be used?</p><p>Example A · Example B</p></div>}
-      <p className="text-label text-muted-foreground">cezar</p>
+      <p className="text-label text-muted-foreground">AZURON</p>
     </div>
   </details>
 }

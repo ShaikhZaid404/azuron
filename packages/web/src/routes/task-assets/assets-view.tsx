@@ -149,7 +149,7 @@ export function AssetsView({ runId, routed, run }: { runId: string; routed: bool
           <span className="px-1 text-xs text-muted-foreground">Assets</span>
         )}
         {current?.kind === 'html' ? (
-          <IconTooltip label="Runs in a sandbox: no access to cezar, your cookies or the network beyond pinned CDN scripts">
+          <IconTooltip label="Runs in a sandbox: no access to AZURON, your cookies or the network beyond pinned CDN scripts">
             <span
               data-slot="assets-sandboxed"
               tabIndex={0}

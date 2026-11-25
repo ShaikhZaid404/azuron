@@ -12,7 +12,6 @@ import { AppearanceProvider } from './components/appearance-provider'
 import { LastLocationController } from './components/last-location-controller'
 import { ReferenceStatusRegistry } from './components/reference-status'
 import { RunNotifications } from './components/run-notifications'
-import { StarPromo } from './components/star-promo'
 import { ThemeProvider } from './components/theme-provider'
 import { Toaster } from './components/ui/toaster'
 import { Telemetry } from './lib/telemetry'
@@ -47,10 +46,6 @@ export function App() {
             card or route) is live per viewport. Muted here at the root because the widget lives in
             the shell for the session, above every route. */}
         <HostUsageProvider>
-          {/* And beside it for the same reason: the star ask's one-time toast watches the same
-              run-list cache for the user's first successful run. Once per browser, ever, and
-              silent when promos are off (`CEZ_NO_BANNER=1`). Renders nothing. */}
-          <StarPromo />
           <ThemeProvider>
             {/* Beside ThemeProvider on purpose: appearance (accent/density) is the ui-state.json
                 half of the same boot contract — mirror pre-paints, server truth reconciles. */}

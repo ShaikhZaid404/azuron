@@ -111,7 +111,7 @@ export const AppShellContainer = memo(function AppShellContainer({ children }: {
   const workspaceConfig = useWorkspaceConfig()
   const branding = workspaceConfig.data?.branding
   const customBranding = branding !== undefined && (
-    branding.name !== 'cezar' || branding.logoUrl !== null
+    (branding.name !== 'AZURON' && branding.name !== 'cezar') || branding.logoUrl !== null
   )
   const starCount = useStarCount(!customBranding && workspaceConfig.data !== undefined)
   // The global inbox is opt-in (#471). With the capability off there is no Inbox nav item to
@@ -284,7 +284,7 @@ export const AppShellContainer = memo(function AppShellContainer({ children }: {
     <ListViewProvider>
       <AppShell
         repo={repo}
-        brandName={workspaceConfig.data?.branding.name ?? 'cezar'}
+        brandName={workspaceConfig.data?.branding.name ?? 'AZURON'}
         brandLogoUrl={workspaceConfig.data?.branding.logoUrl ?? null}
         computerName={workspaceConfig.data?.computerName}
         version={health.data?.version ?? null}

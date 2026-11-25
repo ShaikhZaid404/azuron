@@ -87,7 +87,7 @@ export function TelemetryConsentBanner() {
       <div className="flex flex-wrap items-center gap-x-4 gap-y-3 rounded-lg border bg-card px-4 py-3 shadow-lg">
         <ShieldCheckIcon className="hidden size-[18px] shrink-0 text-violet sm:block" aria-hidden="true" />
         <p className="min-w-0 flex-1 basis-[280px] text-ui leading-relaxed text-muted-foreground">
-          <span className="font-medium text-foreground">Help improve cezar?</span> With your OK we send task
+          <span className="font-medium text-foreground">Help improve AZURON?</span> With your OK we send task
           counts and crash reports to the maintainers — never prompts, code, paths or repo names. Change it
           anytime in Settings → Data & privacy.{' '}
           <button
@@ -158,7 +158,7 @@ export function TelemetryDetailsDialog({
             </span>
             <DialogTitle className="text-xl font-semibold tracking-tight">Usage data, in full</DialogTitle>
             <DialogDescription className="text-sm leading-relaxed text-muted-foreground">
-              Counts of what you use and reports of what broke, so cezar’s maintainers at Open Mercato
+              Counts of what you use and reports of what broke, so AZURON’s maintainers
               can fix bugs without you filing them. Off until you say yes.
             </DialogDescription>
           </div>
@@ -170,7 +170,7 @@ export function TelemetryDetailsDialog({
 
           <p className="text-label leading-relaxed text-soft-foreground">
             Every label is a closed list the server enforces. Withdraw anytime in Settings → Data & privacy or
-            with <code className="font-mono">cezar telemetry disable</code> — the install id is deleted.{' '}
+            with <code className="font-mono">azuron telemetry disable</code> — the install id is deleted.{' '}
             <a href={TELEMETRY_CODE_URL} target="_blank" rel="noopener noreferrer" className="underline underline-offset-2 hover:text-foreground">
               Read the code
             </a>

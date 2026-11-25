@@ -181,7 +181,7 @@ function BrandingFields() {
   }, [branding?.name])
   const commitName = () => {
     const value = name.trim()
-    if (!value) { setName(branding?.name ?? 'cezar'); return }
+    if (!value) { setName(branding?.name ?? 'AZURON'); return }
     if (value !== branding?.name) save.mutate({ branding: { name: value } })
     setLastName(value)
   }
@@ -192,7 +192,7 @@ function BrandingFields() {
           onBlur={commitName}
           onKeyDown={(event) => { if (isCommitKey(event)) { event.preventDefault(); commitName() } }}
           className="h-8 w-56 rounded-md border border-input bg-card px-3 text-sm shadow-xs outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50" />
-        {branding && branding.name !== 'cezar' ? (
+        {branding && branding.name !== 'AZURON' ? (
           <button type="button" data-action="branding-name-reset" disabled={save.isPending}
             onClick={() => save.mutate({ branding: { name: null } })}
             className="text-meta text-muted-foreground underline-offset-4 hover:text-foreground hover:underline disabled:opacity-50">

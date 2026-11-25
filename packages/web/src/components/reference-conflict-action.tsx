@@ -183,7 +183,7 @@ export function ResolveConflictsForPr({ projectId, prNumber }: { projectId: stri
   if (!index.data) return <WaitingButton failed={index.isError} />
   const owner = prOwnerRun(index.data.runs, projectId, prNumber, repoBase)
   if (!owner) {
-    return <span data-slot="reference-conflict-no-owner" className="block opacity-70">No cezar task owns this PR</span>
+    return <span data-slot="reference-conflict-no-owner" className="block opacity-70">No AZURON task owns this PR</span>
   }
   return <ResolveConflictsForRun projectId={projectId} runId={owner.id} prNumber={prNumber} />
 }

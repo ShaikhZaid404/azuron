@@ -70,7 +70,7 @@ describe('index.html boot guard', () => {
     failLoad('link', '/assets/index-old.css')
     expect(reload).not.toHaveBeenCalled()
     const root = document.getElementById('root')!
-    expect(root.textContent).toContain('cezar could not start')
+    expect(root.textContent).toContain('AZURON could not start')
     expect(root.querySelector('a[href="cezar://servers"]')).toBeNull()
     ;(root.querySelector('#cez-boot-reload') as HTMLButtonElement).click()
     expect(reload).toHaveBeenCalledTimes(1)
@@ -82,7 +82,7 @@ describe('index.html boot guard', () => {
     storage.setItem('cez-boot-reload-at', String(Date.now()))
     boot({ storage, userAgent: 'Mozilla/5.0 Mobile/15E148 CezarMobile/0.1.1 (ios)' })
     failLoad('script', '/assets/index-old.js')
-    expect(document.querySelector('a[href="cezar://servers"]')?.textContent).toBe('Your cezars')
+    expect(document.querySelector('a[href="cezar://servers"]')?.textContent).toBe('Your AZURON instances')
   })
 
   it('reloads again after the guard window, so a later update recovers too', () => {
@@ -109,6 +109,6 @@ describe('index.html boot guard', () => {
     document.body.innerHTML = '<div id="root"></div>'
     boot()
     window.__cezBootFallback?.()
-    expect(document.getElementById('root')?.textContent).toContain('cezar could not start')
+    expect(document.getElementById('root')?.textContent).toContain('AZURON could not start')
   })
 })

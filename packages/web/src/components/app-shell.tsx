@@ -6,6 +6,7 @@ import {
   MenuIcon,
   PanelLeftOpenIcon,
   PlusIcon,
+  StarIcon,
 } from 'lucide-react'
 import * as React from 'react'
 import type { ReactNode } from 'react'
@@ -280,7 +281,7 @@ export const AppShell = React.memo(function AppShell({
   singleProject = false,
   banner,
   footerBanner,
-  brandName = 'cezar',
+  brandName = 'AZURON',
   brandLogoUrl = null,
   computerName,
   managersAvailable = false,
@@ -1240,11 +1241,11 @@ export function StarChip({ count }: { count: number }) {
       href={CEZAR_REPO_URL}
       target="_blank"
       rel="noopener noreferrer"
-      title={`Star cezar on GitHub — ${count.toLocaleString()} stars`}
-      aria-label={`Star cezar on GitHub — ${count.toLocaleString()} stars`}
+      title={`Star AZURON on GitHub — ${count.toLocaleString()} stars`}
+      aria-label={`Star AZURON on GitHub — ${count.toLocaleString()} stars`}
       className="flex shrink-0 items-center gap-1 rounded-full border border-border px-1.5 py-px font-mono text-micro font-medium text-soft-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-[3px] focus-visible:ring-ring/50"
     >
-      <span aria-hidden="true">⭐</span>
+      <StarIcon aria-hidden="true" className="size-3 fill-current text-primary" />
       <span>{formatted}</span>
     </a>
   )

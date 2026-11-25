@@ -447,7 +447,7 @@ function SwitcherRow({
           ) : null}
         </span>
         {project.unregistered ? (
-          <span data-slot="project-unregistered" title="cezar is serving this folder — it is not in your saved projects." className="shrink-0 rounded-full bg-muted px-[7px] py-px text-micro font-medium text-soft-foreground">
+          <span data-slot="project-unregistered" title="AZURON is serving this folder — it is not in your saved projects." className="shrink-0 rounded-full bg-muted px-[7px] py-px text-micro font-medium text-soft-foreground">
             not saved
           </span>
         ) : null}

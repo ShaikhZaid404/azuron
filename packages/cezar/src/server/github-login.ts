@@ -171,7 +171,7 @@ export function createDryRunGithubLogin(approveAfterMs = 6_000): GithubLogin {
  */
 export function explainFailure(output: string, exitCode: number | null): string {
   if (/GH_TOKEN|GITHUB_TOKEN/.test(output)) {
-    return 'cezar was started with GH_TOKEN set, and GitHub CLI uses that token instead of signing in. Unset GH_TOKEN and restart cezar.';
+    return 'AZURON was started with GH_TOKEN set, and GitHub CLI uses that token instead of signing in. Unset GH_TOKEN and restart AZURON.';
   }
   if (/expired/i.test(output)) return 'The code expired. Try again for a new one.';
   if (/access_denied|denied|cancel/i.test(output)) return 'Sign-in was cancelled on GitHub. Try again when you are ready.';

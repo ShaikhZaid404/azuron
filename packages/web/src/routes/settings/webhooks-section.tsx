@@ -161,7 +161,7 @@ function WebhookPanel({ projectId, enabled, unsupportedPlatform }: { projectId: 
         : 'Send task updates to Slack, Discord or your own endpoint when a task needs you, is ready for review or finishes.'}
     >
       <div className="flex flex-col gap-2 px-4 py-3 text-ui">
-        {!unsupportedPlatform && <p>Start cezar with <code>CEZ_WEBHOOKS=1</code>, then reload this page. If someone else runs this server, ask them to turn webhooks on.</p>}
+        {!unsupportedPlatform && <p>Start AZURON with <code>CEZ_WEBHOOKS=1</code>, then reload this page. If someone else runs this server, ask them to turn webhooks on.</p>}
         <a className="w-fit underline underline-offset-2 hover:text-foreground" href={guide.href} target="_blank" rel="noreferrer">{guide.note}</a>
       </div>
     </SettingsCard>
@@ -188,7 +188,7 @@ function WebhookPanel({ projectId, enabled, unsupportedPlatform }: { projectId: 
       id="receivers"
       slot="webhooks-receivers"
       title="Receivers"
-      description={<>Each receiver gets the task updates you choose while cezar is running. New receivers stay Inactive until you test and activate them. <a className="underline underline-offset-2 hover:text-foreground" href={guide.href} target="_blank" rel="noreferrer">{guide.note}</a></>}
+      description={<>Each receiver gets the task updates you choose while AZURON is running. New receivers stay Inactive until you test and activate them. <a className="underline underline-offset-2 hover:text-foreground" href={guide.href} target="_blank" rel="noreferrer">{guide.note}</a></>}
       action={<>
         <Button variant="ghost" size="sm" aria-label="Refresh" disabled={list.isFetching} onClick={() => void list.refetch()}><RefreshCwIcon />Refresh</Button>
         <Button ref={addTrigger} size="sm" disabled={list.isPending || !!list.error} onClick={event => { formFocusTarget.current = event.currentTarget; setError(''); setStale(false); setDraft(webhookDraft()); setForm('new') }}><PlusIcon />Add receiver</Button>
@@ -240,7 +240,7 @@ function WebhookPanel({ projectId, enabled, unsupportedPlatform }: { projectId: 
             <DropdownMenuContent align="end" className="w-[220px]">
               {custom && <>
                 <DropdownMenuItem disabled={!!row.retiredKeyExpiresAt && Date.parse(row.retiredKeyExpiresAt) > Date.now()} onSelect={() => openConfirmation({ title: 'Rotate signing key?', text: 'Old and new keys both sign deliveries for 24 hours. Install the new key in your receiver within that time.', run: () => webhookApi.rotate(projectId, row.id, row.revision, 'graceful') }, menuTriggers.current.get(row.id))}><KeyRoundIcon />Rotate key</DropdownMenuItem>
-                <DropdownMenuItem onSelect={() => openConfirmation({ title: 'Revoke old signing keys now?', text: 'Old keys stop signing immediately, and deliveries fail until your receiver uses the new key. Also remove old keys from your receiver — cezar can’t revoke keys it still accepts.', run: () => webhookApi.rotate(projectId, row.id, row.revision, 'revoke_now') }, menuTriggers.current.get(row.id))}><ShieldOffIcon />Revoke old keys</DropdownMenuItem>
+                <DropdownMenuItem onSelect={() => openConfirmation({ title: 'Revoke old signing keys now?', text: 'Old keys stop signing immediately, and deliveries fail until your receiver uses the new key. Also remove old keys from your receiver — AZURON can’t revoke keys it still accepts.', run: () => webhookApi.rotate(projectId, row.id, row.revision, 'revoke_now') }, menuTriggers.current.get(row.id))}><ShieldOffIcon />Revoke old keys</DropdownMenuItem>
                 <DropdownMenuSeparator />
               </>}
               <DropdownMenuItem variant="destructive" onSelect={() => openConfirmation(deleteConfirmation(row), menuTriggers.current.get(row.id))}><Trash2Icon />Delete</DropdownMenuItem>
@@ -289,7 +289,7 @@ function ActivationSummary({ receiver, projectId }: { receiver: WebhookReceiver;
   return <div className="flex min-w-0 flex-col gap-2 text-ui">
     <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-1 rounded-md border border-border bg-card p-3 [overflow-wrap:anywhere]">
       <dt className={term}>Receiver</dt><dd>{receiver.name}</dd>
-      <dt className={term}>Destination</dt><dd>{receiver.format === 'cezar.json.v1' ? 'Custom receiver (signed cezar JSON)' : `${formatLabels[receiver.format]} channel`}</dd>
+      <dt className={term}>Destination</dt><dd>{receiver.format === 'cezar.json.v1' ? 'Custom receiver (signed AZURON JSON)' : `${formatLabels[receiver.format]} channel`}</dd>
       <dt className={term}>URL</dt><dd>{receiver.destination}</dd>
       <dt className={term}>Project</dt><dd>{projectId}</dd>
       <dt className={term}>Message content</dt><dd>{profileLabels[receiver.profile]}</dd>

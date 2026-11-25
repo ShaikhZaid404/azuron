@@ -30,7 +30,7 @@ export function PlanUsageChip({ runId, runner, startedAt }: { runId: string; run
   const week = taskWindows(consumers.data.entries, runId, 'weekly').find((w) => w.account.key === latest.account.key)
   const earlier = windows.slice(1).reduce((sum, w) => sum + w.consumer.estimatePp, 0)
   const rows: PlanUsageRow[] = [
-    ...(c.aloneInferredPp > 0 ? [{ slot: 'plan-usage-alone', label: 'While it was the only cezar task', value: approxPp(c.aloneInferredPp) }] : []),
+    ...(c.aloneInferredPp > 0 ? [{ slot: 'plan-usage-alone', label: 'While it was the only AZURON task', value: approxPp(c.aloneInferredPp) }] : []),
     ...(c.sharedEstimatePp > 0 ? [{ slot: 'plan-usage-shared', label: `Its share while ${ranTogetherLabel(c)} ran`, value: approxPp(c.sharedEstimatePp) }] : []),
     ...(c.retryWasteEstimatePp > 0 ? [{ slot: 'plan-usage-retry', label: 'of which: failed attempts', value: approxPp(c.retryWasteEstimatePp), indent: true }] : []),
     ...(earlier > 0 ? [{ slot: 'plan-usage-earlier', label: 'Earlier 5-hour limits', value: approxPp(earlier) }] : []),

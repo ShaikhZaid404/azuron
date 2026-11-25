@@ -349,7 +349,7 @@ export function SigningBody({ session, who, remote, compact, stepsLabel = 'resum
     case 'terminal':
       return remote ? (
         <>
-          <p className={SUB}>{name} can only sign in on the computer running cezar. Run this there, then come back:</p>
+          <p className={SUB}>{name} can only sign in on the computer running AZURON. Run this there, then come back:</p>
           {session.command ? <CommandLine command={session.command} /> : null}
         </>
       ) : (

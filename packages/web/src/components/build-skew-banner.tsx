@@ -91,11 +91,11 @@ function RestartServer() {
         ) : (
           <span className="text-muted-foreground">
             {capabilities?.localHandoff === false ? (
-              <> Run <code>cezar server-deploy</code> on the host to reload the service.</>
+              <> Run <code>azuron server-deploy</code> on the host to reload the service.</>
             ) : inDesktopApp() ? (
               ' Quit and reopen the app.'
             ) : (
-              <> Stop <code>cezar</code> and start it again.</>
+              <> Stop <code>azuron</code> and start it again.</>
             )}
           </span>
         )}

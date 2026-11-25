@@ -124,7 +124,7 @@ function ProjectsPane({
           value={config.projectsDir}
           title="Default checkout folder"
           hint="Where “Clone from GitHub” and “New project” put new projects: <folder>/<project name>. Created if needed and verified writable before saving. Projects already registered keep their location."
-          placeholder="~/cezar/projects"
+          placeholder="~/azuron/projects"
           slot="checkout"
           refreshProjects
         />

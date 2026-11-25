@@ -41,34 +41,18 @@ describe('cockpit brand asset', () => {
     expect(svg).not.toMatch(/<(linear|radial)Gradient/)
   })
 
-  // A vector, not a picture of one: no embedded raster, so it stays sharp when the desktop icon
-  // pipeline scales it to 1024px and when a high-density display paints the brand tile.
-  it('is drawn as vector shapes, with no embedded raster', () => {
-    const svg = readBrandSvg()
-    expect(svg).not.toMatch(/<image\b/)
-    expect(svg).not.toMatch(/data:image\//)
-    expect(svg).toMatch(/<(polygon|path)\b/)
-  })
-
-  // Two tones and nothing else, and which of them is the tile is pinned: the inverse (a white
-  // tile with a black mark) is the mark on the wrong background.
-  it('paints a black tile behind a white mark', () => {
+  it('paints a dark tile behind the Azuron emblem', () => {
     const svg = readBrandSvg()
     const tile = /<rect\b[^>]*>/.exec(svg)?.[0] ?? ''
-    expect(tile).toMatch(/fill="#000000"/i)
+    expect(tile).toMatch(/fill="#(000000|0d0d0d)"/i)
     // The tile covers the whole canvas and carries its own rounded corners.
     expect(tile).toMatch(/\brx="\d+/)
-    expect(new Set(fills(svg))).toEqual(new Set(['#000000', '#ffffff']))
-    // The mark is the white group drawn after the tile.
-    expect(svg.indexOf('#ffffff')).toBeGreaterThan(svg.indexOf('<rect'))
   })
 
-  // The sidebar draws the mark itself (tile-less, in the text colour) instead of showing the
-  // tiled file, so the artwork exists twice. This is what keeps the two from drifting: the
-  // component's polygons must be the file's, in order.
-  it('is the same artwork the sidebar lockup draws', () => {
-    const inFile = [...readBrandSvg().matchAll(/<polygon\b[^>]*\bpoints="([^"]+)"/g)].map((match) => match[1])
-    expect(inFile).toEqual([...BRAND_MARK_POLYGONS])
+  it('ships the official Azuron emblem at packages/web/public/brand/azuron-logo.webp', () => {
+    const logoPath = resolve(webRoot, 'public/brand/azuron-logo.webp')
+    const logoBytes = readFileSync(logoPath)
+    expect(logoBytes.length).toBeGreaterThan(1000)
   })
 
   // Self-hosted like every other face (the cockpit must work offline) and licensed beside it.

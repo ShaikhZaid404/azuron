@@ -262,7 +262,7 @@ export function ProviderSettings() {
                   {hint ? <span className="mt-0.5 block text-soft-foreground">{hint}</span> : null}
                   {incidentId !== undefined ? (
                     <span className="mt-0.5 block text-soft-foreground">
-                      Use this after completing the provider sign-in flow. cezar cannot validate the
+                      Use this after completing the provider sign-in flow. AZURON cannot validate the
                       credential without a task/model request; it will verify it on the next task.
                     </span>
                   ) : null}

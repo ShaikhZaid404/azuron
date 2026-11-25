@@ -85,7 +85,7 @@ export function diskNote(health: HealthResponse): string | null {
 /** The trigger's hover tooltip: the cezar version, then the blocker if there is one — else
  *  the optional tools still worth knowing about. Exported for the tests. */
 export function toolsTooltip(health: HealthResponse): string {
-  const base = `cezar v${health.version}`
+  const base = `AZURON v${health.version}`
   const blocker = toolsBlocker(health)
   if (blocker) return `${base} · ${blocker}`
   const low = health.disk?.guardWarning

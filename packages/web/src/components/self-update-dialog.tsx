@@ -488,7 +488,7 @@ function ActiveBadge({ data }: { data: SelfUpdateStatus | undefined }) {
 function InstallHint({ data }: { data: SelfUpdateStatus }) {
   const command =
     data.installKind === 'checkout'
-      ? 'node packages/cezar/dist/index.js install'
+      ? 'azuron install'
       : data.installKind === 'global-npm'
         ? 'azuron install'
         : 'npx azuron install'

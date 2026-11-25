@@ -456,7 +456,7 @@ function SettingsSidebarContent({
   const starCount = stars?.available ? (stars.count ?? null) : null
   // White-label branding (main): the same name and logo the app sidebar's lockup and chips show.
   const branding = useWorkspaceConfig().data?.branding
-  const brandName = branding?.name ?? 'cezar'
+  const brandName = branding?.name ?? 'AZURON'
   const brandLogoUrl = branding?.logoUrl ?? null
   const hint = projectRailHint(projectSections)
 
@@ -501,7 +501,7 @@ function SettingsSidebarContent({
           <GroupLabel>Workspace</GroupLabel>
           {/* Global settings are per USER, not per repo — worth saying once, where the choice to
               write there is being made. */}
-          <p data-slot="settings-workspace-note" className="-mt-1 shrink-0 px-2.5 pb-1.5 text-xs text-muted-foreground">Stored in ~/.cezar</p>
+          <p data-slot="settings-workspace-note" className="-mt-1 shrink-0 px-2.5 pb-1.5 text-xs text-muted-foreground">Stored in ~/.azuron</p>
           <GlobalGroupLinks sections={settingsSectionsInGroup('workspace', capabilities)} activeId={globalActive ? activeId : null} />
         </div>
 

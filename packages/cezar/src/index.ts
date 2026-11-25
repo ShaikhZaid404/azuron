@@ -703,7 +703,7 @@ async function runCommand(
   reasoningEffort: string | undefined,
 ): Promise<void> {
   if (!task) {
-    console.error('usage: cezar run "<task>" [--workflow name] [--model model] [--effort value]');
+    console.error('usage: azuron run "<task>" [--workflow name] [--model model] [--effort value]');
     process.exitCode = 1;
     return;
   }
@@ -815,9 +815,9 @@ async function runCommand(
   store.flush({ pretty: true });
   const record = store.getRun(run.id);
   if (final === 'review') {
-    console.log(`\n  changes ready for review on branch ${record?.branch ?? '?'} — inspect them in the cockpit: npx cezar`);
+    console.log(`\n  changes ready for review on branch ${record?.branch ?? '?'} — inspect them in the cockpit: npx azuron`);
   }
-  console.log(`\nrun ${final} — ${record?.tokensUsed ?? 0} tokens — details in the cockpit: npx cezar`);
+  console.log(`\nrun ${final} — ${record?.tokensUsed ?? 0} tokens — details in the cockpit: npx azuron`);
   await manager.lifecycle.shutdown();
   manager.dispose();
   process.off('SIGINT', interrupt);

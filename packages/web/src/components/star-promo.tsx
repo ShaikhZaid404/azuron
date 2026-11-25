@@ -179,22 +179,17 @@ export function StarAskDialog({
         data-slot="star-ask"
         className="gap-0 overflow-hidden p-0 sm:max-w-[440px]"
       >
-        <div className="relative flex h-36 items-center justify-center overflow-hidden border-b bg-card-2">
-          {/* Two violet glows (primary and the lighter violet). Lime lives ONLY in the wordmark
-              gradient (UI strategy, "Colour"); the backdrop is the accent, not the brand pair. */}
-          <div
-            aria-hidden="true"
-            className="absolute inset-0 bg-[radial-gradient(circle_at_22%_35%,color-mix(in_oklab,var(--primary)_32%,transparent),transparent_55%),radial-gradient(circle_at_80%_70%,color-mix(in_oklab,var(--violet)_38%,transparent),transparent_55%)]"
-          />
+        <div className="relative flex h-36 items-center justify-center overflow-hidden border-b border-border bg-card">
           <div aria-hidden="true" className="relative flex items-center gap-4">
             <BrandMark height={52} className="text-foreground" />
-            <span className="flex size-12 items-center justify-center rounded-full border bg-card shadow-md">
-              <StarIcon className="size-6 fill-current text-pending-strong" />
+            <span className="flex size-12 items-center justify-center rounded-full border border-border bg-background shadow-xs">
+              <StarIcon className="size-6 fill-current text-primary" />
             </span>
           </div>
           {count !== null && (
-            <span className="absolute bottom-3 left-1/2 -translate-x-1/2 rounded-full border bg-card/80 px-2.5 py-0.5 font-mono text-meta text-muted-foreground backdrop-blur">
-              ⭐ {formatStarCount(count)} stars on GitHub
+            <span className="absolute bottom-3 left-1/2 flex -translate-x-1/2 items-center rounded-full border border-border bg-background/80 px-2.5 py-0.5 font-mono text-meta text-muted-foreground backdrop-blur">
+              <StarIcon className="mr-1.5 size-3 fill-current text-primary" />
+              {formatStarCount(count)} stars on GitHub
             </span>
           )}
         </div>

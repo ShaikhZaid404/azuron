@@ -52,7 +52,7 @@ const activityLabels: Record<string, string> = {
   notice_acknowledged: 'Change marked as reviewed', history_pruned: 'Old history removed', integrity_reset: 'Webhook data reset',
 }
 
-export const sourceLabels: Record<'cockpit/api' | 'system', string> = { 'cockpit/api': 'cockpit or API', system: 'cezar' }
+export const sourceLabels: Record<'cockpit/api' | 'system', string> = { 'cockpit/api': 'cockpit or API', system: 'AZURON' }
 
 /** Unknown server codes still read as words: `http_404` → `HTTP 404`, `foo_bar` → `Foo bar`. */
 function humanize(code: string) {

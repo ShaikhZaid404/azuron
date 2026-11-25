@@ -763,7 +763,7 @@ export function BrowserView({
             subtitle={
               canPreview
                 ? "Enter the address of the task's app, e.g. http://localhost:3000 — then switch on Design Mode to point at an element and tell the agent what to change."
-                : "Enter the address of the task's app, e.g. http://localhost:3000. This cockpit runs remotely: start the app in the task's terminal (on a hosted cockpit it needs CEZ_TERMINAL=1), and cezar shows the SSH command that forwards its port to you."
+                : "Enter the address of the task's app, e.g. http://localhost:3000. This cockpit runs remotely: start the app in the task's terminal (on a hosted cockpit it needs CEZ_TERMINAL=1), and AZURON shows the SSH command that forwards its port to you."
             }
           />
         ) : (
