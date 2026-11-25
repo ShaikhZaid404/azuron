@@ -1,0 +1,175 @@
+#!/usr/bin/env node
+import { spawn, spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
+const AZURON_HOME = process.env.AZURON_HOME || path.join(os.homedir(), '.azuron');
+const PID_PATH = path.join(AZURON_HOME, 'azuron.pid');
+const LOG_PATH = path.join(AZURON_HOME, 'logs', 'azuron.log');
+const PORT = Number(process.env.AZURON_PORT || 45160);
+const URL = `http://127.0.0.1:${PORT}`;
+
+const rootDir = path.resolve(import.meta.dirname, '..');
+const serverEntry = path.join(rootDir, 'packages', 'server', 'dist', 'index.js');
+const serverTsEntry = path.join(rootDir, 'packages', 'server', 'src', 'index.ts');
+
+function getRunningPid() {
+  if (!fs.existsSync(PID_PATH)) return null;
+  const pid = Number(fs.readFileSync(PID_PATH, 'utf8').trim());
+  if (!Number.isFinite(pid) || pid <= 0) return null;
+  try {
+    process.kill(pid, 0);
+    return pid;
+  } catch {
+    return null;
+  }
+}
+
+function cmdStart() {
+  const existing = getRunningPid();
+  if (existing) {
+    console.log(`[INFO] AZURON is already running (PID ${existing}) at ${URL}`);
+    return;
+  }
+  const entry = fs.existsSync(serverEntry) ? serverEntry : serverTsEntry;
+  const args = ['--max-old-space-size=256'];
+  if (entry.endsWith('.ts')) args.push('--experimental-strip-types');
+  args.push(entry);
+
+  const child = spawn(process.execPath, args, {
+    stdio: 'inherit',
+    env: { ...process.env, AZURON_PORT: String(PORT) },
+  });
+  child.on('exit', (code) => process.exit(code ?? 0));
+}
+
+function cmdStop() {
+  const pid = getRunningPid();
+  if (!pid) {
+    console.log('[INFO] AZURON is not running.');
+    if (fs.existsSync(PID_PATH)) fs.unlinkSync(PID_PATH);
+    return;
+  }
+  process.kill(pid, 'SIGTERM');
+  console.log(`[CHECK] Sent SIGTERM to AZURON (PID ${pid}).`);
+}
+
+async function cmdStatus() {
+  const pid = getRunningPid();
+  if (!pid) {
+    console.log('[INFO] Status: Stopped');
+    return;
+  }
+  try {
+    const res = await fetch(`${URL}/api/health`);
+    const json = await res.json();
+    console.log(`[CHECK] Status: Running (PID ${pid}) | ${URL} | RAM: ${json.memoryMb} MB | Uptime: ${json.uptimeSec}s`);
+  } catch {
+    console.log(`[WARN] Process alive (PID ${pid}) but HTTP health unreachable at ${URL}`);
+  }
+}
+
+function cmdOpen() {
+  console.log(`[INFO] Dashboard URL: ${URL}`);
+  const openers = ['termux-open-url', 'xdg-open', 'open'];
+  for (const opener of openers) {
+    const probe = spawnSync('which', [opener], { encoding: 'utf8' });
+    if (probe.status === 0) {
+      spawn(opener, [URL], { detached: true, stdio: 'ignore' }).unref();
+      return;
+    }
+  }
+}
+
+function cmdDoctor() {
+  console.log('+--------------------------------------------------+');
+  console.log('| AZURON Environment & Termux Diagnostic Doctor    |');
+  console.log('+--------------------------------------------------+');
+  const checks = [
+    ['Node.js', process.version],
+    ['Platform / Arch', `${os.platform()} / ${os.arch()}`],
+    ['AZURON_HOME', AZURON_HOME],
+    ['Default Port', String(PORT)],
+  ];
+  for (const [k, v] of checks) {
+    console.log(`[CHECK] ${k.padEnd(18, ' ')}: ${v}`);
+  }
+  for (const bin of ['git', 'gh', 'agy', 'codex', 'rclone']) {
+    const r = spawnSync('which', [bin], { encoding: 'utf8' });
+    const status = r.status === 0 ? `Found (${r.stdout.trim()})` : 'Not found';
+    console.log(`[CHECK] CLI ${bin.padEnd(14, ' ')}: ${status}`);
+  }
+  if (fs.existsSync(LOG_PATH)) {
+    const tail = fs.readFileSync(LOG_PATH, 'utf8').trim().split('\n').slice(-5);
+    console.log('[INFO] Recent azuron.log entries:');
+    for (const line of tail) console.log(`  ${line}`);
+  }
+}
+
+async function cmdStorageClean(args) {
+  const dryRun = args.includes('--dry-run');
+  const silent = args.includes('--silent');
+  try {
+    const res = await fetch(`${URL}/api/storage/cleanup`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ dryRun }),
+    });
+    const data = await res.json();
+    if (!silent) console.log('[CHECK] Cleanup report:', JSON.stringify(data.report, null, 2));
+  } catch {
+    console.error('[ERROR] Could not reach running AZURON server for cleanup.');
+    process.exit(1);
+  }
+}
+
+function cmdHelp() {
+  console.log('AZURON CLI (Local-First AI Coding Agent Workspace)');
+  console.log('');
+  console.log('Usage: azuron <command>');
+  console.log('  start                  Start AZURON daemon on 127.0.0.1:45160');
+  console.log('  stop                   Stop running AZURON daemon');
+  console.log('  restart                Restart AZURON daemon');
+  console.log('  status                 Inspect daemon health and RAM footprint');
+  console.log('  open                   Open dashboard in browser');
+  console.log('  doctor                 Diagnose Node, Termux, SQLite, and CLIs');
+  console.log('  storage clean          Run retention sweep (--dry-run, --silent)');
+  console.log('  help                   Show this help');
+}
+
+const [, , sub = 'start', ...rest] = process.argv;
+switch (sub) {
+  case 'start':
+    cmdStart();
+    break;
+  case 'stop':
+    cmdStop();
+    break;
+  case 'restart':
+    cmdStop();
+    setTimeout(cmdStart, 500);
+    break;
+  case 'status':
+    await cmdStatus();
+    break;
+  case 'open':
+    cmdOpen();
+    break;
+  case 'doctor':
+    cmdDoctor();
+    break;
+  case 'storage':
+    if (rest[0] === 'clean') {
+      await cmdStorageClean(rest.slice(1));
+    } else {
+      cmdHelp();
+    }
+    break;
+  case 'help':
+  case '--help':
+  case '-h':
+  default:
+    cmdHelp();
+    break;
+}

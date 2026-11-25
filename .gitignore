@@ -1,0 +1,30 @@
+# Dependencies
+node_modules/
+
+# Build output
+packages/contract/dist/
+packages/server/dist/
+packages/web/dist/
+
+# AZURON runtime data (never commit)
+.azuron/
+*.pid
+*.log
+*.key
+
+# Environment
+.env
+.env.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Test artifacts
+packages/server/test/fixtures/

@@ -1,0 +1,37 @@
+{
+  "name": "azuron",
+  "version": "0.1.0",
+  "description": "Premium, local-first AI Coding Agent Workspace for Android & Desktop",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "workspaces": [
+    "packages/contract",
+    "packages/server",
+    "packages/web"
+  ],
+  "scripts": {
+    "build": "npm run build -w @azuron/contract && npm run build -w @azuron/server && npm run build -w @azuron/web",
+    "test": "npm run test -w @azuron/server",
+    "dev:server": "npm run dev -w @azuron/server",
+    "dev:web": "npm run dev -w @azuron/web",
+    "start": "node --max-old-space-size=256 packages/server/dist/index.js",
+    "doctor": "node bin/azuron doctor"
+  },
+  "keywords": [
+    "ai",
+    "agent",
+    "coding",
+    "workspace",
+    "orchestrator",
+    "codex",
+    "antigravity",
+    "termux",
+    "android",
+    "local-first"
+  ],
+  "author": "AZURON Team",
+  "license": "MIT"
+}
