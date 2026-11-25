@@ -90,6 +90,11 @@ export const MODELS_BY_RUNNER: Record<Runner, readonly ModelPreset[]> = {
   ],
   codex: [
     { id: '', label: 'auto', desc: 'Use your Codex default model' },
+    { id: 'gpt-5.2-codex', label: 'gpt-5.2-codex', desc: 'Frontier OpenAI Codex programming model' },
+    { id: 'gpt-5.1-codex', label: 'gpt-5.1-codex', desc: 'Standard high-performance OpenAI Codex model' },
+    { id: 'o3-mini', label: 'o3-mini', desc: 'Fast STEM, algorithmic reasoning and coding' },
+    { id: 'o1', label: 'o1', desc: 'Deep multi-step reasoning and system architecture' },
+    { id: 'gpt-4o', label: 'gpt-4o', desc: 'Versatile multimodal flagship' },
   ],
   opencode: [
     { id: '', label: 'auto', desc: 'Use your OpenCode default model' },
@@ -121,10 +126,13 @@ export const MODELS_BY_RUNNER: Record<Runner, readonly ModelPreset[]> = {
   omp: [
     { id: '', label: 'auto', desc: 'Use your omp default model' },
   ],
-  // Antigravity's slugs (`gemini-3.8-flash-high`, …) come from `agy models` for the signed-in
-  // account; nothing dated is listed here, and the field stays free text for any slug it prints.
   antigravity: [
     { id: '', label: 'auto', desc: 'Use your Antigravity default model' },
+    { id: 'gemini-2.5-pro', label: 'gemini-2.5-pro', desc: 'Advanced reasoning, math, and deep code refactoring' },
+    { id: 'gemini-2.5-flash', label: 'gemini-2.5-flash', desc: 'Ultra-fast, responsive multimodal coding' },
+    { id: 'gemini-3.0-pro', label: 'gemini-3.0-pro', desc: 'Next-gen Google frontier reasoning model' },
+    { id: 'gemini-3.0-flash', label: 'gemini-3.0-flash', desc: 'Next-gen high-efficiency coding model' },
+    { id: 'claude-3-7-sonnet', label: 'claude-3-7-sonnet', desc: 'Hybrid Anthropic Sonnet via Antigravity' },
   ],
   // Gemini CLI has no host catalog in cezar: the ids its ACP `session/new` answer lists (0.60), the
   // server's `KNOWN_PRESETS_BY_RUNNER.gemini`. A free API key serves the Flash models only.

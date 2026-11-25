@@ -30,7 +30,15 @@ export const KNOWN_PRESETS_BY_RUNNER: Record<RunnerId, readonly string[]> = {
   // off the picker when Claude gained host discovery (#784) — a guard that names a specific
   // vendor release goes stale the same way the picker did, and this list mirrors the picker.
   claude: ['fable', 'opus', 'sonnet', 'haiku'],
-  codex: ['gpt-5.1-codex', 'gpt-5.1-codex-mini', 'gpt-5-codex'],
+  codex: [
+    'gpt-5.2-codex',
+    'gpt-5.1-codex',
+    'gpt-5.1-codex-mini',
+    'gpt-5-codex',
+    'o3-mini',
+    'o1',
+    'gpt-4o',
+  ],
   opencode: [],
   // Cursor models are discovered from the CLI / Settings — no hard-coded presets
   // that could conflict with another runner's ids.
@@ -51,12 +59,17 @@ export const KNOWN_PRESETS_BY_RUNNER: Record<RunnerId, readonly string[]> = {
   // from GitHub at run time, and the ids it routes are other vendors' own (`gpt-5.4`,
   // `claude-sonnet-4`). Naming them here would make this guard reject a legitimate codex or
   // claude model as "another runner's preset" — the exact failure pi's comment warns about.
-  // Antigravity lists nothing: its slugs come from `agy models` for the signed-in account.
   copilot: [],
   // omp is pi's successor with the same `provider/model` convention and no default provider
   // (#387's reasoning for pi applies verbatim); its picker gets the same structural guard.
   omp: [],
-  antigravity: [],
+  antigravity: [
+    'gemini-2.5-pro',
+    'gemini-2.5-flash',
+    'gemini-3.0-pro',
+    'gemini-3.0-flash',
+    'claude-3-7-sonnet',
+  ],
   // The ids Gemini CLI 0.60 lists in its ACP `session/new` answer (`models.availableModels`), minus
   // its own `auto` (cezar's implicit `''`) — the composer's `MODELS_BY_RUNNER.gemini`.
   gemini: ['gemini-3.5-flash', 'gemini-3-flash-preview', 'gemini-3.1-flash-lite', 'gemini-2.5-pro'],
@@ -74,8 +87,9 @@ export const KNOWN_PRESETS_BY_RUNNER: Record<RunnerId, readonly string[]> = {
  */
 const NATIVE_MODEL_ID_PREFIX: Partial<Record<RunnerId, RegExp>> = {
   claude: /^claude[-.]/,
-  codex: /^gpt[-.]/,
+  codex: /^(?:gpt|o[13])[-.]/,
   gemini: /^gemini[-.]/,
+  antigravity: /^(?:gemini|claude)[-.]/,
 };
 
 /** Runners whose own bare catalog ids ARE other vendors' ids — Copilot routes `claude-sonnet-4`

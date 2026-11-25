@@ -17,6 +17,7 @@ import { Spinner } from '@/components/ui/spinner'
 import { providerStatusFor } from '@/lib/provider-status'
 import { writeClipboard } from '@/lib/clipboard'
 import { FormRow, SettingsCard } from './form-row'
+import { ConnectProviderDialog } from '@/components/connect-provider-dialog'
 
 /** The provider cards this pane renders, in order. Exported so tests count them from the
  *  source of truth rather than from a literal that a new runner silently invalidates. */
@@ -84,6 +85,7 @@ export function ProviderSettings() {
   const retry = useRetryProviderAuth()
   const queryClient = useQueryClient()
   const [manual, setManual] = useState<ManualCommand | null>(null)
+  const [dialogProvider, setDialogProvider] = useState<{ id: ProviderId; label: string } | null>(null)
   const writeChain = useRef<Promise<unknown>>(Promise.resolve())
   const latestWrites = useRef(providerWriteState(0))
   const pendingWrites = useRef(providerWriteState(0))
@@ -288,17 +290,29 @@ export function ProviderSettings() {
                 </Button>
               ) : null}
               {state === 'disconnected' ? (
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  disabled={connect.isPending}
-                  aria-busy={isConnecting || undefined}
-                  onClick={() => connect.mutate(provider.id)}
-                >
-                  {isConnecting ? <Spinner /> : null}
-                  Connect
-                </Button>
+                <div className="flex items-center gap-1.5">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    disabled={connect.isPending}
+                    aria-busy={isConnecting || undefined}
+                    onClick={() => connect.mutate(provider.id)}
+                  >
+                    {isConnecting ? <Spinner /> : null}
+                    Connect
+                  </Button>
+                  {provider.id === 'antigravity' || provider.id === 'codex' ? (
+                    <Button
+                      type="button"
+                      variant="contrast"
+                      size="sm"
+                      onClick={() => setDialogProvider({ id: provider.id, label: provider.label })}
+                    >
+                      Authorize
+                    </Button>
+                  ) : null}
+                </div>
               ) : null}
               {incidentId !== undefined ? (
                 <Button
@@ -340,12 +354,30 @@ export function ProviderSettings() {
                   >
                     Copy command
                   </Button>
+                  <Button
+                    type="button"
+                    variant="contrast"
+                    size="sm"
+                    onClick={() => setDialogProvider({ id: provider.id, label: provider.label })}
+                  >
+                    Authorize in Browser
+                  </Button>
                 </div>
               </div>
             ) : null}
           </div>
         )
       })}
+      {dialogProvider ? (
+        <ConnectProviderDialog
+          open={Boolean(dialogProvider)}
+          onOpenChange={(open) => {
+            if (!open) setDialogProvider(null)
+          }}
+          provider={dialogProvider.id}
+          label={dialogProvider.label}
+        />
+      ) : null}
     </SettingsCard>
   )
 }

@@ -35,7 +35,8 @@ export function stripAnsi(text: string): string {
 /** The hosts each sign-in may send the user to; anything else falls back to the terminal. */
 const VERIFICATION_HOSTS: Partial<Record<string, readonly string[]>> = {
   claude: ['claude.com', 'claude.ai', 'platform.claude.com'],
-  codex: ['auth.openai.com'],
+  codex: ['auth.openai.com', 'openai.com'],
+  antigravity: ['accounts.google.com', 'aistudio.google.com', 'antigravity.google'],
   cursor: ['cursor.com', 'www.cursor.com'],
   copilot: ['github.com'],
   // OpenCode's own auth providers, keyed `opencode:<id>`.

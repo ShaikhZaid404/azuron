@@ -14,6 +14,7 @@ import { buildChildEnv } from './agent-env.ts';
 import { profileEnv } from './agent-profiles.ts';
 import { startClaudeLogin } from './login-drivers/claude.ts';
 import { startCodexLogin } from './login-drivers/codex.ts';
+import { startAntigravityLogin } from './login-drivers/antigravity.ts';
 import { startCopilotLogin, startCursorLogin } from './login-drivers/cursor-copilot.ts';
 import { startOpenCodeLogin } from './login-drivers/opencode.ts';
 import { createBrowserShim, defaultLoginFetch, loginExecutable, spawnLoginProcess } from './login-drivers/process.ts';
@@ -82,7 +83,7 @@ const ENDED_RETENTION_MS = 10 * 60_000;
 const RECONNECT_COALESCE_MS = 60_000;
 export const DRY_RUN_USER_CODE = 'DRYR-UN00';
 
-const KEY_PROVIDERS = new Set<ProviderId>(['codex', 'opencode']);
+const KEY_PROVIDERS = new Set<ProviderId>(['codex', 'opencode', 'antigravity']);
 const ENDED = new Set<LoginSession['phase']>(['connected', 'failed', 'cancelled']);
 
 const DEFAULT_DRIVERS: Partial<Record<ProviderId, StartDriver>> = {
@@ -91,12 +92,13 @@ const DEFAULT_DRIVERS: Partial<Record<ProviderId, StartDriver>> = {
   cursor: startCursorLogin,
   copilot: startCopilotLogin,
   opencode: startOpenCodeLogin,
+  antigravity: startAntigravityLogin,
 };
 
 const HOSTED_REFUSAL = 'Run this command on the machine hosting cezar.';
 const HOSTED_ACCOUNT_REFUSAL =
   'agent accounts are disabled in hosted mode; set CEZ_REMOTE_AGENT_ACCOUNTS=1 only behind an authenticated perimeter';
-const KEY_REFUSAL = 'API keys are accepted only for Codex and OpenCode.';
+const KEY_REFUSAL = 'API keys are accepted for Antigravity, Codex, and OpenCode.';
 
 interface Entry {
   key: string;

@@ -36,13 +36,25 @@ const pageSchema = z.object({
 const DEFAULT_DISCOVERY_TIMEOUT_MS = 5_000;
 const MAX_MODEL_PAGES = 25;
 const MAX_MODELS = 500;
+export const DEFAULT_CODEX_MODELS: ModelOption[] = [
+  { id: 'gpt-5.2-codex', label: 'GPT-5.2 Codex', description: 'Frontier OpenAI Codex programming model' },
+  { id: 'gpt-5.1-codex', label: 'GPT-5.1 Codex', description: 'Standard high-performance OpenAI Codex model' },
+  { id: 'o3-mini', label: 'o3-mini', description: 'Fast STEM, algorithmic reasoning and coding' },
+  { id: 'o1', label: 'o1', description: 'Deep multi-step reasoning and system architecture' },
+  { id: 'gpt-4o', label: 'GPT-4o', description: 'Versatile multimodal flagship' },
+];
 
 /** Discover the visible catalog exposed by the authenticated host Codex CLI. */
 export async function discoverCodexModels(options: CodexModelDiscoveryOptions): Promise<ModelOption[]> {
-  const child = (options.spawn ?? spawnCodexAppServer)(
-    resolveCodexExecutable(options.bin),
-    options.cwd,
-  );
+  let child: ChildProcessWithoutNullStreams;
+  try {
+    child = (options.spawn ?? spawnCodexAppServer)(
+      resolveCodexExecutable(options.bin),
+      options.cwd,
+    );
+  } catch {
+    return DEFAULT_CODEX_MODELS;
+  }
   const rpc = new CodexAppServerRpc(child);
   let readerError: Error | undefined;
   const reader = (async () => {

@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { existsSync, opendirSync } from 'node:fs';
+import { existsSync, opendirSync, readFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { extname, isAbsolute, join } from 'node:path';
 import { AGENT_MODELS_LOCKED_ENV } from './agent-model-policy.ts';
@@ -538,8 +538,22 @@ const DESCRIPTORS: readonly ProviderDescriptor[] = [
     executable: () => process.env.CEZ_CODEX_BIN ?? 'codex',
     statusArgs: ['login', 'status'],
     loginArgs: ['login'],
-    installHint: 'Install the Codex CLI, then run `codex login`.',
+    installHint: 'Connect OpenAI Codex via 1-click browser auth, API key, or CLI.',
     parse: parseCodexStatus,
+    precheck: () => {
+      if (
+        process.env.OPENAI_API_KEY?.trim() ||
+        process.env.CODEX_API_KEY?.trim() ||
+        process.env.AZURON_CODEX_KEY?.trim()
+      ) {
+        return 'connected';
+      }
+      const codexAuth = join(homedir(), '.codex', 'auth.json');
+      if (existsSync(codexAuth)) return 'connected';
+      const azuronCodex = join(homedir(), '.azuron', 'profiles', 'codex', 'auth.json');
+      if (existsSync(azuronCodex)) return 'connected';
+      return undefined;
+    },
   },
   {
     id: 'opencode',
@@ -627,14 +641,30 @@ const DESCRIPTORS: readonly ProviderDescriptor[] = [
     id: 'antigravity',
     overrideEnv: 'CEZ_AGY_BIN',
     executable: () => resolveAntigravityBin(),
-    // `agy models` needs a session: signed in it lists the account's models and exits 0 (agy 1.4.0),
-    // signed out it exits 1 asking to sign in - without prompting and without spending a request.
     statusArgs: ['models'],
-    // agy has no login subcommand; the first interactive `agy` launch runs the Google sign-in.
     loginArgs: [],
     updateArgs: ['update'],
-    installHint: 'Install the Antigravity CLI (https://antigravity.google/docs/cli), then run `agy` once and sign in with Google.',
+    installHint: 'Connect Antigravity with your Google account via browser or paste a Gemini API key.',
     parse: parseAntigravityStatus,
+    precheck: () => {
+      if (
+        process.env.GEMINI_API_KEY?.trim() ||
+        process.env.GOOGLE_API_KEY?.trim() ||
+        process.env.AZURON_ANTIGRAVITY_KEY?.trim()
+      ) {
+        return 'connected';
+      }
+      const geminiToken = join(homedir(), '.gemini', 'jetski-standalone-oauth-token');
+      if (existsSync(geminiToken)) {
+        try {
+          const content = JSON.parse(readFileSync(geminiToken, 'utf8'));
+          if (content.token || content.id_token) return 'connected';
+        } catch {}
+      }
+      const azuronVault = join(homedir(), '.azuron', 'profiles', 'antigravity', 'token.json');
+      if (existsSync(azuronVault)) return 'connected';
+      return undefined;
+    },
   },
   {
     id: 'gemini',
