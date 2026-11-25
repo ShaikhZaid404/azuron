@@ -1,0 +1,289 @@
+import { useState } from 'react'
+import type { ApiRun } from '@open-mercato/cezar-api-client'
+
+import { useProjectRun, useProjects, useRunsIndex } from '@/api/queries'
+import { ReferenceChip, useCloseReferenceCard } from '@/components/reference-chip'
+import { ReferenceOverflow } from '@/components/reference-overflow'
+import { useReferenceStatusLookup } from '@/components/reference-status'
+import { Button } from '@/components/ui/button'
+import { toast } from '@/components/ui/toaster'
+import { Spinner } from '@/components/ui/spinner'
+import { runTitle } from '@/lib/task-groups'
+import { prioritizeTaskReferences, prNumber, taskReferences, type TaskReferenceInput } from '@/lib/tasks-table'
+import { useAskAnswer } from '@/routes/task-thread/ask-answer'
+import { resolveConflictsPrompt } from '@/routes/task-thread/run-actions'
+
+/**
+ * "Resolve conflicts" — the one thing every surface hands to a conflicting chip's panel.
+ *
+ * One component, and that is the point: the chip was already shared (same orange, same glyph,
+ * same words wherever a reference is painted) while the ACTION was the task page's alone. Four
+ * copies of "build the prompt, pick the delivery seam, disable it with a reason, toast the
+ * failure" is four chances for one page to send differently-worded text or to swallow an error.
+ *
+ * It is only ever MOUNTED inside an open panel (`conflictAction` is a node, see `ReferenceChip`),
+ * which is what lets a hundred-row table pass it per row for free: no delivery exists until a
+ * user hovers a chip that is actually conflicting.
+ */
+export function ResolveConflictsButton({
+  run,
+  projectId,
+  prNumber,
+}: {
+  run: ApiRun
+  /** Named only by a surface standing OUTSIDE this run's project — the global Tasks page, whose
+   *  rows span the registry. Elsewhere the scope is already right. */
+  projectId?: string
+  prNumber?: number
+}) {
+  // Whichever seam this run's state allows — a live message, or a continue for a task parked at
+  // review. Offering a prompt that only worked on a running task would offer it exactly when it
+  // could not be taken: a conflicting PR is usually attached to a task that has already finished.
+  const delivery = useAskAnswer(run, projectId)
+  const close = useCloseReferenceCard()
+  const [busy, setBusy] = useState(false)
+  const pending = busy || delivery.isPending
+  const blocked = Boolean(delivery.blockedBy)
+
+  const press = async () => {
+    if (pending || blocked) return
+    // Read BEFORE the send: delivering flips a parked task to `running`, and by the time the
+    // promise resolves the record no longer says which seam it travelled on.
+    const reopened = delivery.mode === 'resume'
+    setBusy(true)
+    try {
+      const failure = await delivery.send(resolveConflictsPrompt(prNumber))
+      // Both outcomes are announced where the user acted, because the panel is gone by the time
+      // this resolves and three of the four surfaces that offer this button do not show the
+      // transcript the prompt lands in. Saying that a FINISHED task was reopened matters most:
+      // that is a state change the user did not explicitly ask for and would otherwise discover
+      // from a status pill quietly turning green.
+      if (failure) toast(failure, { tone: 'danger' })
+      else {
+        toast(
+          `${reopened ? 'Task reopened' : 'Sent to the task'} — resolving conflicts${
+            prNumber ? ` in PR #${prNumber}` : ''
+          }`,
+        )
+        close()
+      }
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <>
+      {/* The CTA variant, not `outline`: an outline button on this panel is a card-coloured
+          rectangle on a card-coloured surface (`--popover` IS `--card`), which is how it read as
+          an invisible black box. This is the only thing in the panel meant to be pressed. */}
+      <Button
+        type="button"
+        size="sm"
+        data-slot="reference-conflict-action"
+        disabled={blocked || pending}
+        onClick={() => void press()}
+        className="h-7 w-full text-xs"
+      >
+        {pending ? 'Sending…' : 'Resolve conflicts'}
+      </Button>
+      {/* Only the REFUSAL is spelled out. What the button will do is the button's own words —
+          quoting the prompt underneath said the same thing twice, at four times the length. */}
+      {blocked && delivery.reason ? <span className="block opacity-70">{delivery.reason}</span> : null}
+    </>
+  )
+}
+
+/**
+ * The same button for a row that only has an ID — the cross-project case.
+ *
+ * The global Tasks index ships a deliberately slim entry (no `steps`, no `runner`), and whether a
+ * finished task can be reopened is a question only the full record answers. So it fetches one —
+ * but only here, inside a panel that is already open, which is the whole reason the action is a
+ * lazily mounted node: a hundred-row table costs nothing until somebody hovers a chip that is
+ * actually conflicting, and then costs exactly one record.
+ */
+export function ResolveConflictsForRun({
+  projectId,
+  runId,
+  prNumber,
+}: {
+  projectId: string
+  runId: string
+  prNumber?: number
+}) {
+  const run = useProjectRun(projectId, runId)
+  if (!run.data) return <WaitingButton failed={run.isError} />
+  return <ResolveConflictsButton run={run.data} projectId={projectId} prNumber={prNumber} />
+}
+
+/** The button's place while the record it needs is still loading (or could not be). */
+function WaitingButton({ failed }: { failed: boolean }) {
+  return (
+    <Button type="button" size="sm" disabled aria-busy={!failed || undefined} className="h-7 w-full text-xs">
+      {failed ? 'Unavailable' : <><Spinner className="size-3.5 text-current" />Resolve conflicts</>}
+    </Button>
+  )
+}
+
+/**
+ * The task that owns pull request `#number` in `projectId`, read from the runs index: the task
+ * that CREATED it over one that declared it (`CEZ:PR`, e.g. a review task) over one whose chips
+ * merely show it, a live task over an archived one, then the newest. `repoBase` applies the
+ * tables' #854 guard, so a transcript-scraped number from another repository owns nothing.
+ */
+export function prOwnerRun<Run extends TaskReferenceInput & { projectId: string; archived: boolean; createdAt: string }>(
+  runs: readonly Run[],
+  projectId: string,
+  number: number,
+  repoBase?: string,
+): Run | undefined {
+  return prTaskRuns(runs, projectId, number, repoBase)[0]
+}
+
+/** Every task carrying pull request `#number`, in `prOwnerRun`'s order: the owner first. */
+export function prTaskRuns<Run extends TaskReferenceInput & { projectId: string; archived: boolean; createdAt: string }>(
+  runs: readonly Run[],
+  projectId: string,
+  number: number,
+  repoBase?: string,
+): Run[] {
+  const ranked: Array<{ run: Run; rank: number }> = []
+  for (const run of runs) {
+    if (run.projectId !== projectId) continue
+    const tier = ownershipTier(run, number, repoBase)
+    if (tier === undefined) continue
+    ranked.push({ run, rank: tier * 2 + (run.archived ? 1 : 0) })
+  }
+  ranked.sort((a, b) => a.rank - b.rank || (a.run.createdAt > b.run.createdAt ? -1 : a.run.createdAt < b.run.createdAt ? 1 : 0))
+  return ranked.map((entry) => entry.run)
+}
+
+/** 0 created, 1 declared, 2 shown only; `undefined` when the run does not carry the PR at all. */
+function ownershipTier(run: TaskReferenceInput, number: number, repoBase?: string): number | undefined {
+  const refs = run.prRefs ?? []
+  const created =
+    (run.pullRequestUrl !== undefined && Number(prNumber(run.pullRequestUrl)) === number) ||
+    refs.some((ref) => ref.origin === 'created' && ref.number === number)
+  if (created) return 0
+  if (run.markerRefs?.pr === number || refs.some((ref) => ref.origin === 'marker' && ref.number === number)) return 1
+  return taskReferences(run, repoBase).some((reference) => reference.kind === 'PR' && reference.number === number)
+    ? 2
+    : undefined
+}
+
+/**
+ * Resolve conflicts for a chip that knows only a project and a PR number — the Manager chat's
+ * `[[pr:…]]`. Mounted only inside an open conflict panel, so the owner lookup (a read of the
+ * shared runs index, no fetch of its own) costs nothing until then.
+ */
+export function ResolveConflictsForPr({ projectId, prNumber }: { projectId: string; prNumber: number }) {
+  const index = useRunsIndex()
+  const repoBase = useProjects().data?.projects.find((project) => project.id === projectId)?.repoUrl
+  if (!index.data) return <WaitingButton failed={index.isError} />
+  const owner = prOwnerRun(index.data.runs, projectId, prNumber, repoBase)
+  if (!owner) {
+    return <span data-slot="reference-conflict-no-owner" className="block opacity-70">No cezar task owns this PR</span>
+  }
+  return <ResolveConflictsForRun projectId={projectId} runId={owner.id} prNumber={prNumber} />
+}
+
+/** The run a `TaskReferenceChip` paints for: its full record (the chip's own project, from the
+ *  provider), or a slim row plus the project it belongs to — the conflict action then loads the
+ *  record itself (`ResolveConflictsForRun`). */
+type TaskReferenceChipRun =
+  | { run: ApiRun; projectId?: undefined }
+  | { run: TaskReferenceInput & Parameters<typeof runTitle>[0] & { id: string }; projectId: string }
+
+/**
+ * A reference chip for a row that HAS its run record — the chip plus the action, in one call.
+ *
+ * What the tasks tables render, so a conflicting pull request behaves the same whether the user
+ * is looking at the task or at the list it came from. The task page keeps the bare `ReferenceChip`
+ * because it builds its own nodes; everywhere else this is the whole of it — one chip, plus a
+ * `+N` overflow when the task has further PRs.
+ */
+export function TaskReferenceChip({
+  run,
+  reference,
+  className,
+  compact = false,
+  projectId: rowProjectId,
+}: TaskReferenceChipRun & {
+  reference: { kind: 'PR' | 'Issue'; number?: number; url?: string }
+  className?: string
+  /** The narrow sidebar row — the chip's own abbreviation. The panel it opens is the full one:
+   *  there is room for words in a panel wherever the row it hangs off is. */
+  compact?: boolean
+}) {
+  const statuses = useReferenceStatusLookup()
+  const { lookup } = statuses
+  const projectId = rowProjectId ?? statuses.projectId
+  // The caller supplies the already-resolved primary (including a repoBase-synthesized URL).
+  // Add only additional PRs when that primary is a PR; an issue chip must not suddenly grow an
+  // unrelated PR from the run's history, and preserving the supplied primary keeps synthesized
+  // links reachable on surfaces that do not carry project metadata.
+  const additional =
+    reference.kind === 'PR'
+      ? taskReferences(run).filter(
+          (candidate) =>
+            candidate.kind === 'PR' &&
+            (candidate.number !== reference.number ||
+              (!!candidate.url && !!reference.url && candidate.url !== reference.url)),
+        )
+      : []
+  const prioritized =
+    reference.number === undefined
+      ? [reference, ...additional]
+      : prioritizeTaskReferences(
+          [{ ...reference, number: reference.number }, ...additional],
+          (candidate) =>
+            projectId
+              ? lookup({ projectId, kind: candidate.kind, number: candidate.number }).status
+              : undefined,
+        )
+  // A conflicting PR takes the visible slot: it is the one that needs the user, and the chip's
+  // panel is where Resolve conflicts lives — it must not hide behind `+N`.
+  const conflicting = (item: (typeof prioritized)[number]) =>
+    item.kind === 'PR' &&
+    item.number !== undefined &&
+    !!projectId &&
+    lookup({ projectId, kind: 'PR', number: item.number }).conflicting === true
+  const chips = [...prioritized.filter(conflicting), ...prioritized.filter((item) => !conflicting(item))]
+  const [first] = chips
+  if (!first) return null
+  const conflictActionFor = (item: { number?: number }) =>
+    rowProjectId === undefined ? (
+      <ResolveConflictsButton run={run as ApiRun} prNumber={item.number} />
+    ) : (
+      // A slim row (the palettes' cross-project list): the record is fetched by the
+      // action itself, and only once a conflict panel actually opens — as on All tasks.
+      <ResolveConflictsForRun projectId={rowProjectId} runId={run.id} prNumber={item.number} />
+    )
+  // The strongest chip on the row, the rest behind a `+N` — the task header's grouping, with the
+  // same component, so a narrow row never overflows with one chip per PR.
+  const chip = (
+    <ReferenceChip
+      reference={first}
+      taskTitle={runTitle(run)}
+      projectId={rowProjectId}
+      conflictAction={conflictActionFor(first)}
+      className={className}
+      compact={compact}
+    />
+  )
+  // A lone chip stays bare, a direct child of its row.
+  if (chips.length === 1) return chip
+  return (
+    <span data-slot="task-reference-chips" className="flex shrink-0 flex-nowrap items-center gap-1">
+      {chip}
+      <ReferenceOverflow
+        references={chips}
+        taskTitle={runTitle(run)}
+        hidden={chips.length - 1}
+        projectId={rowProjectId}
+        conflictActionFor={conflictActionFor}
+      />
+    </span>
+  )
+}

@@ -1,7 +1,7 @@
 {
   "name": "azuron",
-  "version": "0.1.0",
-  "description": "Premium, local-first AI Coding Agent Workspace for Android & Desktop",
+  "version": "0.21.0",
+  "description": "AZURON — Local-first AI agent workspace for Termux/Android and Linux",
   "private": true,
   "type": "module",
   "engines": {
@@ -9,16 +9,27 @@
   },
   "workspaces": [
     "packages/contract",
-    "packages/server",
+    "packages/api-client",
+    "packages/cezar",
     "packages/web"
   ],
   "scripts": {
-    "build": "npm run build -w @azuron/contract && npm run build -w @azuron/server && npm run build -w @azuron/web",
-    "test": "npm run test -w @azuron/server",
-    "dev:server": "npm run dev -w @azuron/server",
-    "dev:web": "npm run dev -w @azuron/web",
-    "start": "node --max-old-space-size=256 packages/server/dist/index.js",
+    "build": "npm run build:server && npm run build:web",
+    "build:server": "npm run build -w @open-mercato/cezar",
+    "build:web": "npm run build -w @open-mercato/cezar-web",
+    "dev": "node scripts/dev.mjs",
+    "dev:server": "npm run dev -w @open-mercato/cezar --",
+    "dev:web": "npm run dev -w @open-mercato/cezar-web --",
+    "test": "node node_modules/vitest/vitest.mjs run",
+    "start": "node --max-old-space-size=256 packages/cezar/dist/index.js",
     "doctor": "node bin/azuron doctor"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "tsx": "^4.19.0",
+    "typescript": "5.8.2",
+    "vitest": "^4.1.10",
+    "zod": "^4.6.7"
   },
   "keywords": [
     "ai",
@@ -32,6 +43,6 @@
     "android",
     "local-first"
   ],
-  "author": "AZURON Team",
+  "author": "AZURON Team (based on Cezar by open-mercato)",
   "license": "MIT"
 }

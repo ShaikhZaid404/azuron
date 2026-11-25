@@ -1,0 +1,1075 @@
+#!/usr/bin/env node
+// Mock `claude` binary for CEZ_DRY_RUN=1 — emits a plausible stream-json
+// session so the engine / store / GUI can be exercised without tokens.
+// Mirrors the real CLI's contract in SESSION mode: keeps reading {type:user}
+// NDJSON lines from stdin, answers each with a scripted turn (assistant
+// events + a terminal `result`), and exits when stdin closes (EOF).
+
+import { execFileSync, spawnSync } from 'node:child_process';
+import { createInterface } from 'node:readline';
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { dirname, join } from 'node:path';
+import { homedir } from 'node:os';
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// The cosmetic pauses between events exist for the demo cockpit; CEZ_MOCK_PACE scales them
+// (0 = none, the vitest default). `mock:slow`/`mock:pause` are test contracts and never scale.
+const paceEnv = Number(process.env.CEZ_MOCK_PACE);
+const PACE = process.env.CEZ_MOCK_PACE && paceEnv >= 0 ? paceEnv : 1;
+const pace = (ms) => sleep(ms * PACE);
+const write = (obj) => process.stdout.write(`${JSON.stringify(obj)}\n`);
+
+// `--include-partial-messages` → every text/thinking block of an assistant
+// frame is streamed first as `stream_event` deltas, the way the real CLI does:
+// block start, deltas, the whole-block assistant frame, block stop.
+const partialMessages = process.argv.includes('--include-partial-messages');
+
+function streamedBlocks(obj) {
+  if (!partialMessages || obj?.type !== 'assistant' || !Array.isArray(obj.message?.content)) return [];
+  return obj.message.content.flatMap((block, index) => {
+    if (block?.type === 'text' && typeof block.text === 'string' && block.text !== '') {
+      return [{ index, start: { type: 'text', text: '' }, deltaType: 'text_delta', key: 'text', text: block.text }];
+    }
+    if (block?.type === 'thinking' && typeof block.thinking === 'string' && block.thinking.trim() !== '') {
+      return [{ index, start: { type: 'thinking', thinking: '', signature: '' }, deltaType: 'thinking_delta', key: 'thinking', text: block.thinking }];
+    }
+    return [];
+  });
+}
+
+// The model a real CLI reports in `init` and `result.modelUsage`: an alias (or no --model at
+// all, "auto") resolves to a full id, so the cockpit's "auto → <model>" badge is testable.
+const MOCK_MODEL = (() => {
+  const at = process.argv.indexOf('--model');
+  const requested = at >= 0 ? process.argv[at + 1] ?? '' : '';
+  const alias = { '': 'opus', default: 'opus', opus: 'opus', sonnet: 'sonnet', haiku: 'haiku' }[requested];
+  return alias ? `claude-${alias}-5-5` : requested;
+})();
+
+// Like the real CLI, `total_cost_usd` is the session's running total, carried over `--resume`.
+const MOCK_SESSION = (() => {
+  for (const flag of ['--session-id', '--resume']) {
+    const at = process.argv.indexOf(flag);
+    if (at >= 0 && process.argv[at + 1]) return process.argv[at + 1];
+  }
+  return undefined;
+})();
+const mockCostFile = MOCK_SESSION && process.env.CEZ_HOME && /^[A-Za-z0-9-]+$/.test(MOCK_SESSION)
+  ? join(process.env.CEZ_HOME, 'mock-claude-costs', `${MOCK_SESSION}.json`)
+  : undefined;
+const mockTotals = (() => {
+  try {
+    const saved = mockCostFile ? JSON.parse(readFileSync(mockCostFile, 'utf8')) : {};
+    return { total: Number(saved.total) || 0, input: Number(saved.input) || 0, output: Number(saved.output) || 0 };
+  } catch {
+    return { total: 0, input: 0, output: 0 };
+  }
+})();
+function runningCost(obj) {
+  if (obj?.type !== 'result' || typeof obj.total_cost_usd !== 'number') return obj;
+  mockTotals.total += obj.total_cost_usd;
+  mockTotals.input += obj.usage?.input_tokens ?? 0;
+  mockTotals.output += obj.usage?.output_tokens ?? 0;
+  if (mockCostFile) {
+    try {
+      mkdirSync(dirname(mockCostFile), { recursive: true });
+      writeFileSync(mockCostFile, JSON.stringify(mockTotals));
+    } catch {
+      // a read-only home: the total stays per process
+    }
+  }
+  return { ...obj, total_cost_usd: mockTotals.total };
+}
+
+function emit(obj) {
+  obj = runningCost(obj);
+  if (obj?.type === 'result' && !obj.is_error && !obj.modelUsage && !process.env.CEZ_MANAGER_ID) {
+    const usage = obj.usage ?? {};
+    obj = {
+      ...obj,
+      modelUsage: {
+        // Session running totals, like the real CLI's.
+        [MOCK_MODEL]: typeof obj.total_cost_usd === 'number'
+          ? { inputTokens: mockTotals.input, outputTokens: mockTotals.output, costUSD: mockTotals.total }
+          : { inputTokens: usage.input_tokens ?? 0, outputTokens: usage.output_tokens ?? 0, costUSD: 0 },
+      },
+    };
+  }
+  const blocks = streamedBlocks(obj);
+  const envelope = { session_id: obj?.session_id, parent_tool_use_id: obj?.parent_tool_use_id ?? null };
+  for (const block of blocks) {
+    write({ type: 'stream_event', event: { type: 'content_block_start', index: block.index, content_block: block.start }, ...envelope });
+    for (const piece of block.text.match(/\S+\s*|\s+/g) ?? [block.text]) {
+      write({ type: 'stream_event', event: { type: 'content_block_delta', index: block.index, delta: { type: block.deltaType, [block.key]: piece } }, ...envelope });
+    }
+  }
+  write(obj);
+  for (const block of blocks) {
+    write({ type: 'stream_event', event: { type: 'content_block_stop', index: block.index }, ...envelope });
+  }
+}
+
+// Testability hook: CEZ_MOCK_ARGS_FILE=<path> appends the argv this mock was
+// spawned with (one JSON array per line), so tests and dry-run proofs can
+// assert exactly what reached the CLI (e.g. `--append-system-prompt …`).
+if (process.env.CEZ_MOCK_ARGS_FILE) {
+  try {
+    appendFileSync(process.env.CEZ_MOCK_ARGS_FILE, `${JSON.stringify(process.argv.slice(2))}\n`);
+  } catch {
+    // best effort — never break the mock over the hook
+  }
+}
+
+// Testability hook: CEZ_MOCK_MISSING_SESSIONS=<id,id|*> makes `--resume <id>` fail the way the
+// real CLI does once it has pruned that transcript (cleanupPeriodDays).
+const resumeAt = process.argv.indexOf('--resume');
+const resumedId = resumeAt >= 0 ? process.argv[resumeAt + 1] : undefined;
+const missingSessions = (process.env.CEZ_MOCK_MISSING_SESSIONS ?? '').split(',').filter(Boolean);
+if (resumedId && (missingSessions.includes('*') || missingSessions.includes(resumedId))) {
+  // Flushed before exiting: a pipe write is asynchronous on macOS, and exit would drop it.
+  const result = { type: 'result', subtype: 'error_during_execution', is_error: true, session_id: resumedId };
+  await new Promise((resolve) => process.stdout.write(`${JSON.stringify(result)}\n`, resolve));
+  await new Promise((resolve) => process.stderr.write(`No conversation found with session ID: ${resumedId}\n`, resolve));
+  process.exit(1);
+}
+
+// Spec 2026-11-12-manager-connectors: one fake claude.ai connector, so a dry-run manager can be
+// granted it. Manager sessions only (every one carries CEZ_MANAGER_ID): a task's init stays bare.
+// CEZ_MOCK_CONNECTOR_STATUS=failed (or pending, needs-auth) models the reconnect churn.
+const MOCK_CONNECTOR_STATUS = process.env.CEZ_MOCK_CONNECTOR_STATUS || 'connected';
+const MOCK_CONNECTOR_TOOLS = ['mcp__claude_ai_Google_Calendar__list_events', 'mcp__claude_ai_Google_Calendar__create_event'];
+emit(process.env.CEZ_MANAGER_ID
+  ? {
+      type: 'system',
+      subtype: 'init',
+      mcp_servers: [{ name: 'claude.ai Google Calendar', status: MOCK_CONNECTOR_STATUS }],
+      tools: ['Bash', 'Read', 'Grep', 'Glob', ...(MOCK_CONNECTOR_STATUS === 'connected' ? MOCK_CONNECTOR_TOOLS : [])],
+    }
+  : { type: 'system', subtype: 'init', model: MOCK_MODEL });
+
+// Plan usage windows, so the dry-run header shows its live gauges (real wire shape), and the
+// plan-usage ledger sees a rising account (spec 2026-11-19-plan-usage). Every ordinary turn
+// reads the shared mock account: a stable 5-hour window, +2% per turn across all mock processes.
+// A `mock:limit` session returns before this and reports only its terminal limit.
+function emitPlanWindows() {
+  const now = Date.now();
+  const fiveHours = 5 * 3600_000;
+  const start = Math.floor(now / fiveHours) * fiveHours;
+  // The cezar home, never the shared temp dir: a predictable world-writable path is a planting target.
+  const stateDir = join(process.env.CEZ_HOME || join(homedir(), '.cezar'), 'mock');
+  const stateFile = join(stateDir, `plan-${start}.json`);
+  let used = 0.15;
+  try { used = JSON.parse(readFileSync(stateFile, 'utf8')).used; } catch { /* first turn of this window */ }
+  used = Math.min(0.99, Math.round((used + 0.02) * 100) / 100);
+  try { mkdirSync(stateDir, { recursive: true, mode: 0o700 }); writeFileSync(stateFile, JSON.stringify({ used }), { mode: 0o600 }); } catch { /* read-only tmp: a flat reading */ }
+  emit({
+    type: 'rate_limit_event',
+    rate_limit_info: {
+      status: 'allowed',
+      unifiedWindows: {
+        five_hour: { utilization: used, resetsAt: Math.floor((start + fiveHours) / 1000) },
+        seven_day: { utilization: Math.min(0.99, used / 4 + 0.1), resetsAt: Math.floor((Math.floor(now / 604_800_000) + 1) * 604_800) },
+      },
+    },
+  });
+}
+
+let turn = 0;
+
+// `mock:autonomous` → the autonomous auto-nudge fixture (#autonomous). Cezar's nudge text is
+// fixed and carries no `mock:` marker, so a marker-per-message mock could never end such a
+// session: the first turn would end plainly, every nudge would end plainly, and the run would
+// only stop at MAX_AUTO_CONTINUES. This one flag ARMS the session instead — the turn that
+// answers the nudge ends with CEZ:DONE — so a dry-run test can watch a nudged run complete
+// rather than time out.
+let autonomousArmed = false;
+let askRepeat = false;
+let monitoringSticky = false;
+let askRewordClean = false;
+let askRewordMonitoring = false;
+let askRepeatClean = false;
+// `mock:ask-reword` → the same blocker on every turn, worded differently each time. This models
+// an agent trying another workaround after each nudge instead of repeating the exact question.
+let askReword = false;
+// `mock:empty` arms the stuck-agent fixture the same way: once the task text
+// carries the marker, EVERY later turn — including nudge answers, which bear
+// no marker of their own — ends having produced nothing.
+let emptyArmed = false;
+// `mock:empty-monitor` → the interleaved shape behind the #1198 review's M2: four empty turns,
+// then ONE substantive turn that parks on CEZ:MONITORING, then empty turns again (the wake-up
+// answers included). Counted per armed session.
+let emptyMonitorArmed = false;
+let emptyMonitorTurns = 0;
+// Must stay a prefix of `AUTONOMOUS_NUDGE` in `src/workflows/run.ts`. This is a plain script
+// and cannot import it, so `autonomous-nudge.test.ts` reads this line back and asserts the
+// coupling — reword the nudge and that test fails HERE rather than as an opaque timeout.
+const AUTONOMOUS_NUDGE_PREFIX = 'Continue working autonomously';
+
+// A tiny generated PNG (320x200) standing in for a browser screenshot.
+const MOCK_SCREENSHOT_B64 =
+  'iVBORw0KGgoAAAANSUhEUgAAAUAAAADICAIAAAAWZq/8AAACMklEQVR42u3csQnAIBRFUQdJY+b4tfvP4AhCLKyyghAMMRw4Ezz/bU0RBdhUMgEIGBAwIGAQMCBgQMCAgEHAgIABAYOAAQEDAgYEDAIGBAwsCLhfDdiUgEHAgIABAYOAAQEDAgYEDAIGBAwIGAT8vlEr/ImAQcACBgELGAQsYAQsYBCwgEHAAgYBe3IELGAQsIBBwAJGwAIGAQsYBCxgELCAEbCAQcACBgELGAQMAhYwCFjAIGABI2D/QgMCBgEDAgYEDAgYBAwIGBAwCBgQMCBgQMAgYEDAgIBBwCYAAQMCBgQMAgYEDAgYEDAIGBAwIGAQMCBgQMCAgEHAgIABAQMCBgEDAgYEDAIGBAwIGBAwCBgQMCBgQMAgYEDAgIBBwICAAQEDAgYBAwIGBAwCtgIIGBAwIGAQMCBgQMCAgEHAgIABAYOAeejMB/McjIAFLGABW0HAAhYwmhSwgAUsYAQsYAELGAELWMACRsACFrCAEbCABSxgBCxgAQtYwAhYwAIWMAIWsIAFjIAFLGABI2ABC1jACFjAAhYwAhawgAWMgAUsYAEjYAELWMACRsACFrCAEbCABSxgBCxgAQsYAQtYwAJGwAIWMCBgQMAgYEDAgIBBwICAAQEDAgYBAwIGBAwCBgQMCBgQMAgYEDAgYEDAIGBAwICAQcCAgAEBAwIGAQMCBgQMCBgEDAgYEDAIGBAwIGBAwCBgQMCAgAEBg4ABAQMCBgEDAgYEDAgYBAx8xQ1bxBr9kelHqgAAAABJRU5ErkJggg==';
+
+
+// Spec 007: behave like an agent that read the handoff/todos instructions —
+// append a progress line to CEZ_HANDOFF_FILE and a follow-up entry to
+// CEZ_TODOS_FILE, so the inbox loop is testable without tokens.
+function writeHandoffAndTodo() {
+  try {
+    const handoff = process.env.CEZ_HANDOFF_FILE;
+    if (handoff) {
+      const text = readFileSync(handoff, 'utf8');
+      const line = `- ${new Date().toISOString()} — mock: implemented the change (dry run)\n`;
+      const marker = '## Progress log\n';
+      const idx = text.indexOf(marker);
+      const next =
+        idx >= 0
+          ? text.slice(0, idx + marker.length) + '\n' + line + text.slice(idx + marker.length).replace(/^\n+/, '')
+          : text + line;
+      writeFileSync(handoff, next, 'utf8');
+    }
+  } catch {
+    // best effort — the mock still answers without a handoff file
+  }
+  try {
+    const todosFile = process.env.CEZ_TODOS_FILE;
+    if (todosFile) {
+      let items = [];
+      try {
+        items = JSON.parse(readFileSync(todosFile, 'utf8'));
+      } catch {
+        items = []; // missing or broken file — start fresh, append-only
+      }
+      if (!Array.isArray(items)) items = [];
+      items.push({
+        ts: new Date().toISOString(),
+        taskId: process.env.CEZ_TASK_ID,
+        summary: 'Follow up: verify the mock change',
+        suggestedPrompt: 'Verify the change from the previous task',
+      });
+      writeFileSync(todosFile, JSON.stringify(items, null, 2), 'utf8');
+    }
+  } catch {
+    // best effort
+  }
+}
+
+// Spec 2026-10-31-managers: a scripted manager turn that really calls `cez-manager`, so cards and
+// proposals are the ones the routes produced. Deterministic: first task, first ready pull request.
+/** True the first time this message fails on auth in this cezar home; later replays succeed.
+ *  Without `CEZ_HOME` (no sandboxed home to write to) it fails every time, as before. */
+function firstAuthFailure(text) {
+  const home = process.env.CEZ_HOME;
+  if (!home) return true;
+  const dir = join(home, 'mock-auth-once');
+  const marker = join(dir, createHash('sha256').update(text).digest('hex').slice(0, 16));
+  try {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    // Exclusive create: the existence check and the write are one step.
+    writeFileSync(marker, '', { flag: 'wx', mode: 0o600 });
+    return true;
+  } catch (error) {
+    return error?.code !== 'EEXIST';
+  }
+}
+
+async function managerTurn(userText) {
+  const kind = /\[cez-manager:(chat|watch|job|followup)\]/.exec(userText)?.[1] ?? 'chat';
+  const said = userText.slice(userText.lastIndexOf(`[cez-manager:${kind}]`));
+  // `mock:auth-error` fails a manager turn the way a revoked login does, once per message: the turn a
+  // reconnect replays then answers (spec 2026-11-18-inline-account-reconnect).
+  if (said.includes('mock:auth-error') && firstAuthFailure(said)) {
+    emit({ type: 'result', subtype: 'success', is_error: true, result: 'Failed to authenticate. API Error: 401 OAuth access token has been revoked.', usage: { input_tokens: 0, output_tokens: 0 }, total_cost_usd: 0 });
+    return;
+  }
+  emitPlanWindows();
+  const tool = (args) => {
+    const id = `toolu_manager_${turn}_${args.join('_').replace(/\W+/g, '_').slice(0, 40)}`;
+    emit({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'tool_use', id, name: 'Bash', input: { command: `cez-manager ${args.join(' ')}` } }], usage: { input_tokens: 90, output_tokens: 30 } } });
+    let output = '';
+    let failed = false;
+    try {
+      output = execFileSync('cez-manager', args, { encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch (error) {
+      failed = true;
+      output = String(error?.stderr || error?.message || error);
+    }
+    emit({ type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content: output, is_error: failed }] } });
+    return failed ? undefined : output;
+  };
+  const parsed = (output) => {
+    try {
+      return JSON.parse(output ?? '');
+    } catch {
+      return undefined;
+    }
+  };
+  const say = async (text) => {
+    await pace(150);
+    emit({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text }], usage: { input_tokens: 400, output_tokens: 80 } } });
+    await pace(100);
+    emit({ type: 'result', subtype: 'success', result: text, usage: { input_tokens: 400, output_tokens: 80 }, total_cost_usd: 0.0123 });
+  };
+  if (kind === 'watch') {
+    const count = Number(/New attention items: (\d+)/.exec(userText)?.[1] ?? 0);
+    const key = /"projectId":"([^"]+)","title":"[^"]*"(?:,"number":(\d+))?/.exec(userText);
+    if (count === 0 || userText.includes('mock:quiet')) return say('MANAGER:QUIET');
+    return say(`${count} thing${count === 1 ? '' : 's'} need${count === 1 ? 's' : ''} you.${key?.[2] ? ` Start with [[pr:${key[1]}/${key[2]}]].` : ''} (dry run)`);
+  }
+  if (kind === 'job') return say('Job done: nothing changed since the last run. (dry run)');
+  // A followed task settled: build on its card, the way the follow-up prompt asks.
+  if (kind === 'followup') {
+    const cards = [...said.matchAll(/\[\[task:[^\]]+\]\]/g)].map((match) => match[0]);
+    // A task waiting on the user: its decision goes on a question card, as the prompt asks.
+    if (said.includes('Needs you')) {
+      return say(`The task is waiting for you. (dry run)\n\nCEZ:ASK ${JSON.stringify({ questions: [
+        { header: 'Approve', question: 'Commit and push what the task prepared?', options: [{ label: 'Commit and push (recommended)', description: 'The task commits its changes and pushes them.' }, { label: 'Not yet', description: 'Leave the changes for your review.' }] },
+      ] })}`);
+    }
+    return say(`Followed up on ${cards.length === 1 ? 'that task' : `${cards.length} tasks`}: the result is in, nothing blocks the next step. (dry run)`);
+  }
+  // The same test contracts as a task turn, so Stop and the queue are observable in a chat.
+  if (said.includes('mock:slow')) await sleep(25_000);
+  else if (said.includes('mock:pause')) await sleep(2_000);
+  const status = parsed(tool(['status', '--json']));
+  await pace(150);
+  const projects = status?.projects ?? [];
+  // What the manager prompt teaches: a pasted text reaches the task server-side, never in argv.
+  if (/\bfile (?:this|it)\b/i.test(said) && projects[0]) {
+    const filed = tool(['task', 'create', '--project', projects[0].projectId, '--title', 'Filed from the chat', '--attach-last-user-message', 'File the text the user sent']);
+    const card = /\[\[task:[^\]]+\]\]/.exec(filed ?? '')?.[0];
+    return say(card ? `Filed it, word for word:\n\n${card}` : 'I could not file that. (dry run)');
+  }
+  let card = projects.flatMap((project) => project.tasks.map((task) => `[[task:${project.projectId}/${task.runId}]]`))[0];
+  if (!card && projects[0]) {
+    const created = tool(['task', 'create', '--project', projects[0].projectId, '--title', 'Dry-run task', 'Say hello from the manager']);
+    card = /\[\[task:[^\]]+\]\]/.exec(created ?? '')?.[0];
+  }
+  const lines = [card ? `Here is where things stand:\n\n${card}` : 'Nothing is running yet.'];
+  if (/\bmerge\b/i.test(said)) {
+    const pr = projects.flatMap((project) => project.prs.filter((candidate) => !candidate.draft).map((candidate) => ({ projectId: project.projectId, number: candidate.number })))[0];
+    const proposed = pr && tool(['merge', '--project', pr.projectId, String(pr.number), '--reason', 'Checks pass and nothing blocks it (dry run).']);
+    // Worded from the tool's output, as a real model would: a repeat finds the card already waiting.
+    lines.push(!proposed
+      ? 'There is no pull request I can propose merging.'
+      : /^already pending/.test(proposed)
+        ? `Merging [[pr:${pr.projectId}/${pr.number}]] is already waiting for your approval: its card is earlier in the chat, and the approvals button takes you there.`
+        : `I proposed merging [[pr:${pr.projectId}/${pr.number}]]. Approve the card when you are ready.`);
+  }
+  // A granted calendar write: proposed through the card, never called directly.
+  if (/\bcalendar\b/i.test(said) && /\badd\b/i.test(said)) {
+    const proposed = tool(['propose-action', '--connector', 'claude_ai_Google_Calendar', '--tool', 'create_event', '--args', JSON.stringify({ summary: 'Kick-Off', start: '2027-01-21', end: '2027-01-22' }), '--reason', 'You asked for it (dry run).']);
+    lines.push(proposed ? 'I proposed adding the event. Approve the card and I will add it.' : 'Calendar is not granted to me, or it is temporarily unavailable.');
+  }
+  if (/\bquestions?\b/i.test(said)) {
+    lines.push('I need two decisions.', `CEZ:ASK ${JSON.stringify({ questions: [
+      { header: 'Shell', question: 'Which mobile shell should we use?', options: [{ label: 'Capacitor (recommended)', description: 'Wraps the existing cockpit.' }, { label: 'Tauri 2', description: 'Shares the desktop stack.' }] },
+      { header: 'Default', question: 'Does a phone browser open on Manager?', options: [{ label: 'No (recommended)' }, { label: 'Yes' }] },
+    ] })}`);
+  }
+  // A card naming pull requests: its markers paint as chips inside the question and the options.
+  const repo = projects[0]?.projectId;
+  if (/\bdependabot\b/i.test(said) && repo) {
+    const pr = (number) => `[[pr:${repo}/${number}]]`;
+    // Its source task declares a PR and an issue (`mock:refs`), so the Source block shows chips too.
+    const source = /\[\[task:[^\]]+\]\]/.exec(tool(['task', 'create', '--project', repo, '--title', 'Assess the bumps', 'Assess the bumps mock:refs']) ?? '')?.[0];
+    lines.push(`Two Dependabot bumps are open.${source ? ` I looked at them in ${source}.` : ''}`, `CEZ:ASK ${JSON.stringify({ questions: [
+      { header: 'Dependabot', question: `Should I start assessment tasks for ${pr(2897)} and ${pr(2896)}?`, options: [
+        { label: 'Assess both (recommended)', description: `One read-only task each for ${pr(2897)} and ${pr(2896)}.` },
+        { label: `Only ${pr(2897)}`, description: 'The frontend bump; the other waits.' },
+        { label: 'Neither' },
+      ] },
+    ] })}`);
+  }
+  // A card that names its PRs as `project/N` and a bare number: the first is a chip, the second stays words.
+  if (/\bsupersede\b/i.test(said) && repo) {
+    lines.push('One PR may supersede another.', `CEZ:ASK ${JSON.stringify({ questions: [
+      { header: '2902 + 2894', question: `Should I assess ${repo}/2902 and check whether it makes 2894 unnecessary?`, options: [
+        { label: 'Assess it (recommended)', description: `One read-only task for [[pr:${repo}/2902]].` },
+        { label: 'Leave both' },
+      ] },
+    ] })}`);
+  }
+  return say(lines.join('\n\n'));
+}
+
+/** Runs the `--settings` PreToolUse hooks the way the real CLI does: exit 2 blocks, with stderr as the reason. */
+function preToolUseDenial(tool, input) {
+  const at = process.argv.indexOf('--settings');
+  if (at < 0) return undefined;
+  let settings;
+  try {
+    settings = JSON.parse(readFileSync(process.argv[at + 1], 'utf8'));
+  } catch {
+    return undefined;
+  }
+  for (const entry of settings?.hooks?.PreToolUse ?? []) {
+    if (entry.matcher && entry.matcher !== '*' && !new RegExp(`^(?:${entry.matcher})$`).test(tool)) continue;
+    for (const hook of entry.hooks ?? []) {
+      if (hook.type !== 'command') continue;
+      const run = spawnSync(hook.command, { shell: true, input: JSON.stringify({ hook_event_name: 'PreToolUse', tool_name: tool, tool_input: input }), encoding: 'utf8' });
+      if (run.status === 2) return run.stderr || 'blocked by hook';
+    }
+  }
+  return undefined;
+}
+
+// A manager's approved connector call: one tool_use of the named tool with the approved input
+// (`mock:tamper` in it changes the input first, so the hook's denial is testable dry).
+async function connectorCall(userText) {
+  const tool = /\[cez-connector-call\] (\S+)/.exec(userText)?.[1];
+  const raw = /<input>\n([\s\S]*?)\n<\/input>/.exec(userText)?.[1] ?? '{}';
+  const finish = async (text) => {
+    await pace(100);
+    emit({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text }], usage: { input_tokens: 200, output_tokens: 20 } } });
+    emit({ type: 'result', subtype: 'success', result: text, usage: { input_tokens: 200, output_tokens: 20 }, total_cost_usd: 0.001 });
+  };
+  if (!tool || MOCK_CONNECTOR_STATUS !== 'connected' || !MOCK_CONNECTOR_TOOLS.includes(tool)) return finish('CONNECTOR-UNAVAILABLE');
+  let input = JSON.parse(raw);
+  if (raw.includes('mock:tamper')) input = { ...input, tampered: true };
+  const id = `toolu_connector_${turn}`;
+  emit({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'tool_use', id, name: tool, input }], usage: { input_tokens: 200, output_tokens: 20 } } });
+  const denied = preToolUseDenial(tool, input);
+  emit({ type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content: denied ?? `Created event (dry run): ${JSON.stringify(input)}`, is_error: Boolean(denied) }] } });
+  return finish(denied ? 'The call was blocked.' : 'Done. (dry run)');
+}
+
+// Spec 2026-10-22-html-artifacts: publish a self-contained page into CEZ_ARTIFACTS_DIR, so a
+// dry run (and the e2e suite) sees the whole artifacts path work.
+const DEMO_ARTIFACT_HTML = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Dry-run demo report</title>
+<style>body{font:15px/1.5 system-ui,sans-serif;margin:2rem;color:#1a1a1a;background:#fafafa}
+@media (prefers-color-scheme:dark){body{color:#eee;background:#151515}}h1{font-size:1.4rem}</style>
+</head><body><h1>Dry-run demo report</h1>
+<p>The mock agent wrote this page into its artifacts directory.</p>
+<p id="clock"></p><script>document.getElementById('clock').textContent = 'Rendered at ' + new Date().toLocaleTimeString();</script>
+</body></html>
+`;
+function writeDemoArtifact() {
+  try {
+    const dir = process.env.CEZ_ARTIFACTS_DIR;
+    if (dir) writeFileSync(`${dir}/demo.html`, DEMO_ARTIFACT_HTML, 'utf8');
+  } catch {
+    // best effort — a missing directory just means no demo page
+  }
+}
+
+// Spec 2026-10-22 (Assess Impact): the bundled demo model, left for the server's backstop to
+// render into impact.html — the mock never runs `cez impact render` itself.
+function writeDemoReview() {
+  const dir = process.env.CEZ_ARTIFACTS_DIR;
+  if (!dir) return;
+  for (const rel of ['../src/impact/demo-review.json', '../dist/impact/demo-review.json']) {
+    try {
+      writeFileSync(`${dir}/review.json`, readFileSync(new URL(rel, import.meta.url), 'utf8'), 'utf8');
+      return;
+    } catch {
+      // not in this layout (src only in a checkout, dist only once built/installed)
+    }
+  }
+}
+
+async function respond(userText, imageCount) {
+  turn += 1;
+  await pace(250);
+  if (userText.includes('[cez-connector-call]')) return connectorCall(userText);
+  if (userText.includes('[cez-manager:')) return managerTurn(userText);
+  // `mock:done` anywhere in the message → the reply ends with the CEZ:DONE
+  // completion marker (#347), so the auto-close path is testable dry. `mock:report` implies it:
+  // a unit that has reported is finished, and a report with no done marker would leave the child
+  // parked instead of settling into the report its parent is waiting for.
+  // `mock:autonomous` arms the dry autonomous loop: once armed, the first nudge the engine sends
+  // is answered with CEZ:DONE, so a nudged run settles instead of looping to the cap.
+  if (userText.includes('mock:autonomous')) autonomousArmed = true;
+  if (userText.includes('mock:empty-monitor')) emptyMonitorArmed = true;
+  else if (userText.includes('mock:empty')) emptyArmed = true;
+  // `mock:ask-repeat` → the SAME CEZ:ASK on this turn and on every later one (a nudge included):
+  // the agent that is blocked on something no nudge can fix and keeps asking about it.
+  if (userText.includes('mock:ask-repeat')) askRepeat = true;
+  // `mock:monitoring-sticky` → this turn and every later one (a wake-up nudge included) ends with
+  // CEZ:MONITORING: the watcher whose downstream work never finishes.
+  if (userText.includes('mock:monitoring-sticky')) monitoringSticky = true;
+  if (userText.includes('mock:ask-reword')) askReword = true;
+  if (userText.includes('mock:ask-reword-clean')) askRewordClean = true;
+  if (userText.includes('mock:ask-reword-monitoring')) askRewordMonitoring = true;
+  if (userText.includes('mock:ask-repeat-clean')) askRepeatClean = true;
+  // An inbox digest delivered into the session is answered with CEZ:DONE: the dry run proves the
+  // message reached the model, then settles.
+  // `mock:done-refs` → CEZ:DONE with a task-reference line AFTER it, the order an agent that
+  // declares its PR last really emits.
+  const doneMarker = userText.includes('mock:done-refs')
+    ? '\n\nCEZ:DONE\nCEZ:PR=4243'
+    : userText.includes('mock:done') ||
+        userText.includes('## Tree inbox') ||
+        (autonomousArmed && userText.includes(AUTONOMOUS_NUDGE_PREFIX))
+      ? '\n\nCEZ:DONE'
+      : '';
+  // `mock:monitoring` → the reply ends with CEZ:MONITORING, the "still working
+  // on downstream work" marker (#490), so the monitoring-status path is testable dry.
+  // `mock:monitoring-refs` → the same marker, but with task-reference marker lines AFTER it
+  // (#933): the handoff contract asks for those "as soon as you know", so an agent that opens
+  // its PR in the same turn it parks on its sub-agents emits exactly this shape. It used to
+  // bury the marker and park the run as `waiting` ("needs you").
+  const monitoringMarker = (monitoringSticky || userText.includes('mock:monitoring') || (askRewordMonitoring && turn === 2))
+    ? userText.includes('mock:monitoring-refs')
+      ? '\n\nCEZ:MONITORING\nCEZ:PR=4242\nCEZ:TITLE=waiting on dispatched sub-agents'
+      : '\n\nCEZ:MONITORING'
+    : '';
+  // `mock:ask` → the reply ends with a valid CEZ:ASK marker (#473), so the
+  // AskUser card path (park `waiting` + emit `ask.requested`) is testable dry.
+  // `mock:ask-bad` → a MALFORMED marker (invalid JSON), to prove graceful
+  // degradation: the run still parks `waiting`, no ask card, prose preserved.
+  // `mock:ask-invalid` → syntactically valid JSON that FAILS the ask schema
+  // (empty questions) — the shape behind the blank-question bug: no card will
+  // ever render it, so the marker must survive in the v1 text.
+  // `mock:ask-near` → bounded presentation drift: harmless extra keys plus
+  // an overlong header/description. It should normalize into exactly one card.
+  // `mock:ask-truncated` → a complete payload one closing brace short (#936):
+  // the closer repair should still produce one card, note the recovery, and
+  // strip the raw marker (which ends on `]`, not `}`).
+  // `mock:ask-refs` → the same valid marker, but with task-reference marker lines AFTER it
+  // (#997, the ASK twin of `mock:monitoring-refs`): the handoff contract asks for those "as
+  // soon as you know" and names only DONE/MONITORING as coming last, so an agent that declares
+  // its issue in the turn it asks emits exactly this shape. It used to bury the marker — no
+  // card, and in a dispatched task an inbox message could answer the Guard instead of the human.
+  // `mock:ask-many` → six distinct questions, one of them with six options:
+  // over the old 4/4 caps, which refused the whole payload and showed the user
+  // raw JSON. It must now render as exactly one card, and a dispatched child
+  // parking on it must still write a run record its index parser can read.
+  const askMarker = userText.includes('mock:ask-many')
+    ? '\n\nCEZ:ASK ' +
+      JSON.stringify({
+        questions: Array.from({ length: 6 }, (_, index) => ({
+          header: `Area ${index}`,
+          question: `Decision ${index} — which way?`,
+          options: Array.from({ length: index === 0 ? 6 : 2 }, (_, option) => ({
+            label: `Option ${index}.${option}`,
+          })),
+        })),
+      })
+    : userText.includes('mock:ask-bad')
+    ? '\n\nCEZ:ASK {not valid json'
+    : userText.includes('mock:ask-invalid')
+      ? '\n\nCEZ:ASK {"questions":[]}'
+      : userText.includes('mock:ask-truncated')
+        ? '\n\nCEZ:ASK {"questions":[{"header":"Lint scope","question":"How much of the lint backlog should I land now?","multiSelect":false,"options":[{"label":"First slice only"},{"label":"Rule by rule"},{"label":"Whole backlog"}]}]'
+      : userText.includes('mock:ask-near')
+        ? '\n\nCEZ:ASK ' +
+          JSON.stringify({
+            transportHint: 'render as chips',
+            questions: [
+              {
+                header: 'Implementation path',
+                question: 'Which implementation should I use?',
+                presentation: 'compact',
+                options: [
+                  { label: 'Minimal', description: 'd'.repeat(300), recommended: true },
+                  { label: 'Expanded', description: 'Touch the wider surface' },
+                ],
+              },
+            ],
+          })
+      : (askRewordClean && turn === 2) || (askRewordMonitoring && turn === 2) || (askRepeatClean && turn === 2)
+        ? ''
+      : askReword || askRewordClean || askRewordMonitoring
+        ? '\n\nCEZ:ASK ' +
+          JSON.stringify({
+            questions: [
+              {
+                header: 'Blocked',
+                question: `The cockpit refused "cez task create" (attempt ${turn}) — how should I proceed?`,
+                options: [
+                  { label: 'Grant the capability', description: 'Enable dispatch for this run' },
+                  { label: 'Do it inline', description: 'Skip dispatch and work serially' },
+                ],
+              },
+            ],
+          })
+      : userText.includes('mock:ask') || askRepeat || askRepeatClean
+      ? '\n\nCEZ:ASK ' +
+        JSON.stringify({
+          questions: [
+            {
+              header: 'Library',
+              question: 'Which date library should I standardize on?',
+              options: [
+                { label: 'date-fns', description: 'Tree-shakeable, functional' },
+                { label: 'Luxon', description: 'Immutable, tz-aware' },
+              ],
+            },
+          ],
+        }) +
+        (userText.includes('mock:ask-refs') ? '\nCEZ:ISSUE=997\nCEZ:TITLE=asking before declaring' : '')
+      : '';
+  // `mock:verdict=<name>` → the reply ends with `CEZ:VERDICT <name>`, a graph agent node's
+  // branch choice (spec 2026-09-30-workflow-node-editor). cezar's one-shot verdict nudge carries
+  // no `mock:` marker, so it is answered with the FIRST verdict it lists — which makes the nudge
+  // path testable dry: omit the marker on the first turn, get the verdict on the nudge.
+  const verdictMatch = /mock:verdict=([A-Za-z0-9_-]+)/.exec(userText);
+  const nudgeMatch = userText.includes('You did not end with a verdict.')
+    ? /CEZ:VERDICT ([A-Za-z0-9_-]+)/.exec(userText)
+    : null;
+  const verdictMarker = verdictMatch
+    ? `\n\nCEZ:VERDICT ${verdictMatch[1]}`
+    : nudgeMatch
+      ? `\n\nCEZ:VERDICT ${nudgeMatch[1]}`
+      : '';
+  // `mock:refs` → the reply carries the in-band task-reference markers
+  // (spec 2026-07-18-task-ref-markers), so the declaration path is testable dry.
+  const refsMarkers = userText.includes('mock:refs')
+    ? '\nCEZ:PR=4242\nCEZ:ISSUE=17\nCEZ:TITLE=implementing marker refs'
+    : '';
+
+  // `mock:slow` → hold the turn for ~25 s so queue states are observable. `mock:pause` → ~2 s,
+  // long enough for a test to drop a file into the run's inbox before its turn ends.
+  if (userText.includes('mock:slow')) await sleep(25_000);
+  else if (userText.includes('mock:pause')) await sleep(2_000);
+
+  // Mirrors the real Claude Code 2.1.148 revoked-token envelope: the CLI puts
+  // the credential failure in an `is_error` result even though its subtype is
+  // `success`, rather than emitting a dedicated error frame.
+  // A reconnect's continuation answers (spec 2026-11-18-inline-account-reconnect): it quotes the
+  // original task text, so the trigger alone would re-park the task forever.
+  if (userText.includes('mock:auth-error') && !userText.includes('Your sign-in was renewed')) {
+    emit({
+      type: 'result',
+      subtype: 'success',
+      is_error: true,
+      result: 'Failed to authenticate. API Error: 401 OAuth access token has been revoked.',
+      usage: { input_tokens: 0, output_tokens: 0 },
+      total_cost_usd: 0,
+    });
+    return;
+  }
+
+  // `mock:overloaded` / `mock:credit` → a transient provider failure (76aa46a9) and an account
+  // state one (7d0a1d6d), in the same `is_error` result envelope (core/agent-failure-class.ts).
+  const accountOrProviderError = userText.includes('mock:overloaded')
+    ? 'API Error: 529 Overloaded. This is a server-side issue, usually temporary — try again in a moment.'
+    : userText.includes('mock:oauthrace')
+      ? 'Failed to refresh OAuth token: another Claude Code process is refreshing it or exited mid-refresh. This is usually transient; retry in a minute.'
+    : userText.includes('mock:credit') ? 'Credit balance is too low'
+    : userText.includes('mock:enospc') ? 'ENOSPC: no space left on device, write' : undefined;
+  if (accountOrProviderError) {
+    emit({
+      type: 'result',
+      subtype: 'success',
+      is_error: true,
+      result: accountOrProviderError,
+      usage: { input_tokens: 0, output_tokens: 0 },
+      total_cost_usd: 0,
+    });
+    return;
+  }
+
+  // `mock:limit` → the envelope Claude Code emits when the subscription window is
+  // exhausted: an `is_error` result whose text is the machine-readable
+  // `Claude AI usage limit reached|<epoch seconds>` marker. Makes the auto-resume path
+  // (spec 2026-08-03-auto-resume-after-usage-limit) reachable under CEZ_DRY_RUN=1 for QA and
+  // the e2e smoke. `CEZ_MOCK_LIMIT_RESET_SECONDS` moves the reset instant (default 60 s out),
+  // so a dry run can actually watch the resume fire instead of reading about it.
+  if (userText.includes('mock:limit')) {
+    const configured = Number(process.env.CEZ_MOCK_LIMIT_RESET_SECONDS ?? '60');
+    const seconds = Number.isFinite(configured) ? configured : 60;
+    emit({
+      type: 'result',
+      subtype: 'success',
+      is_error: true,
+      result: `Claude AI usage limit reached|${Math.floor(Date.now() / 1000) + seconds}`,
+      usage: { input_tokens: 0, output_tokens: 0 },
+      total_cost_usd: 0,
+    });
+    return;
+  }
+  emitPlanWindows();
+
+  // `mock:empty` → the stuck-agent fixture: no assistant text, no tool calls,
+  // just an empty result so the turn ends having produced nothing. Armed by the
+  // task text and sticky for the session, because nudge answers carry no marker
+  // of their own. An autonomous run fed only this spins the turn-end nudge at
+  // full speed doing the per-turn git/diff/namer work (the shape that wedged a
+  // host on tens of thousands of empty turns) — the empty-turn breaker must
+  // park it after MAX_CONSECUTIVE_EMPTY_TURNS instead of nudging to the cap.
+  if (emptyMonitorArmed) {
+    emptyMonitorTurns += 1;
+    if (emptyMonitorTurns === 5) {
+      emit({
+        type: 'assistant',
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'Watching the downstream work (dry-run mock).\n\nCEZ:MONITORING' }],
+          usage: { input_tokens: 10, output_tokens: 10 },
+        },
+      });
+      emit({ type: 'result', subtype: 'success', result: '', usage: { input_tokens: 10, output_tokens: 10 }, total_cost_usd: 0 });
+      return;
+    }
+    emit({ type: 'result', subtype: 'success', result: '', usage: { input_tokens: 10, output_tokens: 0 }, total_cost_usd: 0 });
+    return;
+  }
+  if (emptyArmed) {
+    emit({
+      type: 'result',
+      subtype: 'success',
+      result: '',
+      usage: { input_tokens: 10, output_tokens: 0 },
+      total_cost_usd: 0,
+    });
+    return;
+  }
+
+  // `mock:md` → answer with a markdown-rich reply (#346 QA: tables, nested
+  // lists, emphasis, fences, quotes) instead of the scripted turn.
+  if (userText.includes('mock:md')) {
+    const md = [
+      '## Markdown fixture',
+      'This paragraph is soft-wrapped\nacross two source lines.',
+      '',
+      '| Column | Align | Result |',
+      '|:-------|:-----:|-------:|',
+      '| left `code` | *center* | **42** |',
+      '| ~~old~~ new | mid | $1.50 |',
+      '',
+      '- top item with *emphasis*',
+      '  - nested child with `code`',
+      '    - [x] deep done task',
+      '  - [ ] nested todo',
+      '- second top',
+      '',
+      '> quoted intro',
+      '> - quoted list item',
+      '',
+      '```ts',
+      'const answer: number = 42;',
+      '```',
+      'Literal guards: snake_case_name, 2*3 and <script>alert(1)</script>.',
+    ].join('\n');
+    emit({
+      type: 'assistant',
+      message: { role: 'assistant', content: [{ type: 'text', text: md }], usage: { input_tokens: 100, output_tokens: 200 } },
+    });
+    await pace(100);
+    emit({ type: 'result', subtype: 'success', result: md, usage: { input_tokens: 100, output_tokens: 200 }, total_cost_usd: 0.001 });
+    return;
+  }
+
+  // `mock:subagents` → a parallel fan-out: two `Task` spawns whose child items
+  // carry `parent_tool_use_id`, interleaved the way a real fan-out interleaves,
+  // then their results. Makes the Agents dock and its drill-down sheet reachable
+  // under CEZ_DRY_RUN=1 for QA, screenshots and the e2e smoke (spec
+  // `.ai/specs/2026-07-20-grouped-subagent-display.md` §"Testability hook", #474).
+  // Derived from the `subagent-task.ndjson` golden fixture's wire shape.
+  if (userText.includes('mock:subagents')) {
+    const agents = [
+      {
+        id: `toolu_task_a_${turn}`,
+        description: 'Audit the auth flow',
+        subagent_type: 'general-purpose',
+        steps: [
+          { text: 'Scanning the auth middleware.' },
+          { tool: 'Grep', id: `toolu_sub_a1_${turn}`, input: { pattern: 'session', path: 'src' }, result: 'src/middleware.ts:12:  clearSession()' },
+          { tool: 'Read', id: `toolu_sub_a2_${turn}`, input: { file_path: 'src/middleware.ts' }, result: 'export function middleware() { clearSession() }' },
+        ],
+        result: 'The session cookie is dropped in src/middleware.ts:12 (clearSession on every redirect).',
+      },
+      {
+        id: `toolu_task_b_${turn}`,
+        description: 'Review the store layer',
+        subagent_type: 'code-reviewer',
+        steps: [
+          { text: 'Reading the runs store.' },
+          { tool: 'Bash', id: `toolu_sub_b1_${turn}`, input: { command: 'npm test -- runs/store' }, result: '12 passed' },
+        ],
+        result: 'Store layer looks correct; one debounce edge case worth a follow-up.',
+      },
+    ];
+
+    // Both spawns first — that is what makes it a FAN-OUT rather than two
+    // sequential agents, and what the dock's "N/M" odometer counts.
+    for (const agent of agents) {
+      emit({
+        type: 'assistant',
+        message: {
+          role: 'assistant',
+          content: [
+            {
+              type: 'tool_use',
+              id: agent.id,
+              name: 'Task',
+              input: { description: agent.description, prompt: `${agent.description}.`, subagent_type: agent.subagent_type },
+            },
+          ],
+          usage: { input_tokens: 900, output_tokens: 95 },
+        },
+        parent_tool_use_id: null,
+      });
+      await pace(200);
+    }
+
+    // Children, interleaved across agents so the activity lines visibly race.
+    const maxSteps = Math.max(...agents.map((agent) => agent.steps.length));
+    for (let i = 0; i < maxSteps; i += 1) {
+      for (const agent of agents) {
+        const step = agent.steps[i];
+        if (!step) continue;
+        if (step.text !== undefined) {
+          emit({
+            type: 'assistant',
+            message: { role: 'assistant', content: [{ type: 'text', text: step.text }], usage: { input_tokens: 300, output_tokens: 25 } },
+            parent_tool_use_id: agent.id,
+          });
+        } else {
+          emit({
+            type: 'assistant',
+            message: {
+              role: 'assistant',
+              content: [{ type: 'tool_use', id: step.id, name: step.tool, input: step.input }],
+              usage: { input_tokens: 40, output_tokens: 50 },
+            },
+            parent_tool_use_id: agent.id,
+          });
+          await pace(250);
+          emit({
+            type: 'user',
+            message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: step.id, content: step.result }] },
+            parent_tool_use_id: agent.id,
+          });
+        }
+        await pace(250);
+      }
+    }
+
+    // The spawns settle — `parent_tool_use_id: null`, they belong to the main turn.
+    for (const agent of agents) {
+      emit({
+        type: 'user',
+        message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: agent.id, content: agent.result }] },
+        parent_tool_use_id: null,
+      });
+      await pace(200);
+    }
+
+    const summary = 'Both sub-agents reported back: the redirect drops the cookie in src/middleware.ts:12, and the store layer is clean. (dry-run mock)';
+    emit({
+      type: 'assistant',
+      message: { role: 'assistant', content: [{ type: 'text', text: summary }], usage: { input_tokens: 400, output_tokens: 60 } },
+      parent_tool_use_id: null,
+    });
+    await pace(150);
+    emit({
+      type: 'result',
+      subtype: 'success',
+      result: summary,
+      usage: { input_tokens: 2100, output_tokens: 380 },
+      total_cost_usd: 0.0512,
+    });
+    return;
+  }
+
+  // Task auto-naming spec: a naming call (marked `[cez-namer]`) answers a
+  // deterministic short title + a PR classification of the sample number so
+  // dry-run tests can assert the full apply pipeline.
+  if (userText.includes('[cez-namer]')) {
+    const numbered = /(?:^|\D)(\d{1,7})(?:\D|$)/.exec(userText);
+    // Branch naming instructions (spec 2026-10-11-branch-naming-instructions): a canned branch
+    // so dry-run tests can assert the fork used it. Only when the prompt carried instructions.
+    const named = userText.includes('Branch naming instructions:');
+    const name = JSON.stringify({
+      title: 'implementing cr fixes',
+      ...(numbered ? { pr: Number(numbered[1]) } : {}),
+      ...(named ? { branch: 'feature/implementing cr fixes' } : {}),
+    });
+    emit({
+      type: 'assistant',
+      message: {
+        role: 'assistant',
+        content: [{ type: 'text', text: name }],
+        usage: { input_tokens: 200, output_tokens: 30 },
+      },
+    });
+    await pace(50);
+    emit({
+      type: 'result',
+      subtype: 'success',
+      result: name,
+      usage: { input_tokens: 200, output_tokens: 30 },
+      total_cost_usd: 0.0002,
+    });
+    return;
+  }
+
+  // Spec 008: a planning call (marked `[cez-planner]` in the user prompt)
+  // gets a canned chain plan. The `code-review` skill is deliberately made up:
+  // the planner's sanitizer strips unknown skills, and the step survives on
+  // its prompt — which is exactly the path worth exercising in dry runs.
+  if (userText.includes('[cez-planner]')) {
+    const plan = JSON.stringify({
+      title: 'implement-verify-review',
+      steps: [
+        { name: 'Implement', prompt: '{{task}}' },
+        { name: 'Verify', command: 'npm test' },
+        { name: 'Review', skill: 'code-review', prompt: 'Review the changes for {{task}}' },
+      ],
+      rationale: 'Implement, verify with tests, then review.',
+    });
+    emit({
+      type: 'assistant',
+      message: {
+        role: 'assistant',
+        content: [{ type: 'text', text: plan }],
+        usage: { input_tokens: 500, output_tokens: 120 },
+      },
+    });
+    await pace(100);
+    emit({
+      type: 'result',
+      subtype: 'success',
+      result: plan,
+      usage: { input_tokens: 500, output_tokens: 120 },
+      total_cost_usd: 0.0011,
+    });
+    return;
+  }
+
+  if (turn === 1) {
+    // An assess-impact step changes nothing in the worktree; it leaves only a review model.
+    const assessing = userText.includes('cez impact render');
+    // Leave a visible trace in the cwd (the task worktree under spec 006) so
+    // the Diff view has something real to show in dry runs. Exactly one line
+    // per spawned session: tests read this file back as a per-step trace, so
+    // a multi-line prompt must not become multiple lines here.
+    try {
+      const head = userText.replace(/\s+/g, ' ').trim().slice(0, 400);
+      if (!assessing) appendFileSync('notes.md', `mock notes — ${new Date().toISOString()}: ${head}\n`);
+    } catch {
+      // read-only cwd — the mock still works, just without a diff
+    }
+    writeHandoffAndTodo();
+    writeDemoArtifact();
+    if (assessing) writeDemoReview();
+    emit({
+      type: 'assistant',
+      message: {
+        role: 'assistant',
+        content: [{ type: 'text', text: `Okay — looking into: ${userText.slice(0, 120)}` }],
+        usage: { input_tokens: 850, output_tokens: 40 },
+      },
+    });
+    await pace(300);
+    emit({
+      type: 'assistant',
+      message: {
+        role: 'assistant',
+        content: [{ type: 'tool_use', id: `toolu_mock_${turn}`, name: 'Bash', input: { command: 'git status --short' } }],
+        usage: { input_tokens: 120, output_tokens: 55 },
+      },
+    });
+    await pace(300);
+    emit({
+      type: 'user',
+      message: {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: `toolu_mock_${turn}`, content: ' M src/example.ts' }],
+      },
+    });
+    await pace(200);
+    // Agent screenshot in a tool result — exercises the image pipeline
+    // (persist to <id>-images/, serve via /api/runs/:id/images/, zoomable
+    // card + lightbox in the transcript).
+    emit({
+      type: 'assistant',
+      message: {
+        role: 'assistant',
+        content: [{ type: 'tool_use', id: `toolu_mock_shot_${turn}`, name: 'Screenshot', input: { name: 'repro-login-redirect.png' } }],
+        usage: { input_tokens: 80, output_tokens: 30 },
+      },
+    });
+    await pace(200);
+    emit({
+      type: 'user',
+      message: {
+        role: 'user',
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: `toolu_mock_shot_${turn}`,
+            content: [
+              { type: 'text', text: 'Repro captured: after reload the session toast appears and you are back on /login.' },
+              { type: 'image', source: { type: 'base64', media_type: 'image/png', data: MOCK_SCREENSHOT_B64 } },
+            ],
+          },
+        ],
+      },
+    });
+    await pace(300);
+    emit({
+      type: 'assistant',
+      message: {
+        role: 'assistant',
+        content: [{ type: 'text', text: `Done with the first pass — opened a draft PR: https://github.com/open-mercato/demo/pull/123. Anything to adjust? (dry-run mock)${refsMarkers}${doneMarker}${monitoringMarker}${askMarker}${verdictMarker}` }],
+        usage: { input_tokens: 300, output_tokens: 90 },
+      },
+    });
+    await pace(150);
+    emit({
+      type: 'result',
+      subtype: 'success',
+      result: 'Done with the first pass (dry run).',
+      usage: { input_tokens: 1270, output_tokens: 185 },
+      total_cost_usd: 0.0342,
+    });
+    return;
+  }
+
+  const imgNote = imageCount > 0 ? ` I can see ${imageCount} image(s) you attached.` : '';
+  emit({
+    type: 'assistant',
+    message: {
+      role: 'assistant',
+      content: [{ type: 'text', text: `Follow-up #${turn - 1} received: "${userText.slice(0, 100)}".${imgNote} Applied (dry run).${refsMarkers}${doneMarker}${monitoringMarker}${askMarker}${verdictMarker}` }],
+      usage: { input_tokens: 200, output_tokens: 60 },
+    },
+  });
+  await pace(150);
+  emit({
+    type: 'result',
+    subtype: 'success',
+    result: `Follow-up #${turn - 1} handled (dry run).`,
+    usage: { input_tokens: 200, output_tokens: 60 },
+    total_cost_usd: 0.0051,
+  });
+}
+
+const rl = createInterface({ input: process.stdin });
+let queue = Promise.resolve();
+rl.on('line', (line) => {
+  const trimmed = line.trim();
+  if (!trimmed) return;
+  let userText = '(unparseable message)';
+  let imageCount = 0;
+  try {
+    const msg = JSON.parse(trimmed);
+    const blocks = msg?.message?.content ?? [];
+    userText = blocks.filter((b) => b.type === 'text').map((b) => b.text).join('\n') || '(no text)';
+    imageCount = blocks.filter((b) => b.type === 'image').length;
+  } catch {
+    // keep placeholders
+  }
+  // Testability hook: CEZ_MOCK_STDIN_FILE=<path> appends the FULL inbound
+  // text + image count (one JSON object per line) — the scripted replies
+  // below only echo a truncated slice, so tests asserting exact wiring (e.g.
+  // #357's pasted-attachment path note in the prompt) need the untruncated
+  // text this hook captures.
+  if (process.env.CEZ_MOCK_STDIN_FILE) {
+    try {
+      appendFileSync(process.env.CEZ_MOCK_STDIN_FILE, `${JSON.stringify({ userText, imageCount })}\n`);
+    } catch {
+      // best effort — never break the mock over the hook
+    }
+  }
+  queue = queue.then(() => respond(userText, imageCount));
+});
+rl.on('close', () => {
+  // EOF = session over; finish any in-flight turn then exit cleanly.
+  queue.then(() => process.exit(0));
+});

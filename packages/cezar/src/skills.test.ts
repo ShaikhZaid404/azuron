@@ -1,0 +1,423 @@
+import { mkdtemp, mkdir, rm, symlink, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import {
+  BUILTIN_SKILLS_DIR,
+  discoverSkills,
+  filterImportedTeamSkills,
+  layerSkillExtensions,
+  parseFrontmatter,
+  readImportedSkills,
+  type Skill,
+} from './skills.ts';
+
+/**
+ * The opt-out gate's two pure halves (#391 follow-up: the promo banner is gone, replaced by
+ * per-skill curation). `readImportedSkills` parses a user-editable ui-state as a tri-state
+ * (absent = not curated = keep all); `filterImportedTeamSkills` applies the gate. Kept pure so
+ * they are testable without a network clone — the gated repo set is otherwise a vendor default.
+ */
+
+const OM = 'open-mercato/skills';
+const tempDirs: string[] = [];
+
+afterEach(async () => {
+  await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+});
+
+function teamSkill(name: string, repo: string): Skill {
+  return {
+    name,
+    body: `${name} body`,
+    path: `${repo}@main:${name}/SKILL.md`,
+    source: 'team',
+    team: { repo, ref: 'main', path: `${name}/SKILL.md`, dir: true },
+  };
+}
+
+function localSkill(name: string): Skill {
+  return { name, body: `${name} body`, path: `/repo/.ai/cezar/skills/${name}.md`, source: 'cezar' };
+}
+
+describe('readImportedSkills', () => {
+  it('returns the string names from a well-formed array', () => {
+    expect(readImportedSkills({ importedSkills: ['pr-create', 'code-review'] })).toEqual([
+      'pr-create',
+      'code-review',
+    ]);
+  });
+
+  it('returns undefined for a missing key — not curated, so the caller keeps all', () => {
+    expect(readImportedSkills({})).toBeUndefined();
+  });
+
+  it('returns undefined for a non-array (a hand-edited file) — the safe, keep-all reading', () => {
+    expect(readImportedSkills({ importedSkills: 'pr-create' })).toBeUndefined();
+  });
+
+  it('distinguishes an explicit empty array (curated to nothing) from absent', () => {
+    expect(readImportedSkills({ importedSkills: [] })).toEqual([]);
+  });
+
+  it('drops non-string and empty entries rather than throwing', () => {
+    expect(readImportedSkills({ importedSkills: ['ok', 42, '', null, 'fine'] })).toEqual(['ok', 'fine']);
+  });
+});
+
+describe('filterImportedTeamSkills', () => {
+  const gated = new Set([OM]);
+
+  it('keeps every gated-repo skill when not curated (undefined) — opt-out default, no upgrade break', () => {
+    const skills = [teamSkill('pr-create', OM), teamSkill('code-review', OM)];
+    expect(filterImportedTeamSkills(skills, gated, undefined).map((s) => s.name)).toEqual([
+      'pr-create',
+      'code-review',
+    ]);
+  });
+
+  it('drops a gated-repo skill once curated away (explicit empty array)', () => {
+    const skills = [teamSkill('pr-create', OM), teamSkill('code-review', OM)];
+    expect(filterImportedTeamSkills(skills, gated, []).map((s) => s.name)).toEqual([]);
+  });
+
+  it('keeps only the named skills from a gated repo when curated', () => {
+    const skills = [teamSkill('pr-create', OM), teamSkill('code-review', OM)];
+    expect(filterImportedTeamSkills(skills, gated, ['code-review']).map((s) => s.name)).toEqual([
+      'code-review',
+    ]);
+  });
+
+  it('keeps every skill from a repo that is not gated (custom team repo auto-loads)', () => {
+    const skills = [teamSkill('alpha', 'acme/team-skills'), teamSkill('beta', 'acme/team-skills')];
+    expect(filterImportedTeamSkills(skills, gated, []).map((s) => s.name)).toEqual(['alpha', 'beta']);
+  });
+
+  it('never gates a local skill (no team field), even when curated to nothing', () => {
+    const skills = [localSkill('house-rules'), teamSkill('pr-create', OM)];
+    expect(filterImportedTeamSkills(skills, gated, []).map((s) => s.name)).toEqual(['house-rules']);
+  });
+
+  it('gates nothing when the gated set is empty (repo configured its own skillsRepos)', () => {
+    const skills = [teamSkill('pr-create', OM)];
+    expect(filterImportedTeamSkills(skills, new Set(), []).map((s) => s.name)).toEqual(['pr-create']);
+  });
+});
+
+describe('discoverSkills local entrypoints', () => {
+  it('recognizes only scalar true as the interactive composer hint', async () => {
+    const repoRoot = await mkdtemp(join(tmpdir(), 'cezar-skills-'));
+    tempDirs.push(repoRoot);
+    const skillsDir = join(repoRoot, '.ai/cezar/skills');
+    await mkdir(skillsDir, { recursive: true });
+    await writeFile(join(skillsDir, 'true.md'), '---\r\ninteractive: "true"\r\n---\r\nBody');
+    await writeFile(join(skillsDir, 'false.md'), '---\ninteractive: false\n---\nBody');
+    await writeFile(join(skillsDir, 'array.md'), '---\ninteractive: [true]\n---\nBody');
+    await writeFile(join(skillsDir, 'yes.md'), '---\ninteractive: yes\n---\nBody');
+    await writeFile(join(skillsDir, 'missing.md'), 'Body');
+
+    const skills = (await discoverSkills(repoRoot)).filter((skill) => skill.source === 'cezar');
+    expect(skills.find((skill) => skill.name === 'true')).toMatchObject({
+      interactive: true,
+      body: 'Body',
+    });
+    for (const name of ['false', 'array', 'yes', 'missing']) {
+      expect(skills.find((skill) => skill.name === name)?.interactive).toBeUndefined();
+    }
+  });
+
+  it('keeps flat and SKILL.md skills while excluding nested reference files', async () => {
+    const repoRoot = await mkdtemp(join(tmpdir(), 'cezar-skills-'));
+    tempDirs.push(repoRoot);
+    const skillsDir = join(repoRoot, '.ai/cezar/skills');
+    await mkdir(join(skillsDir, 'om-example/references'), { recursive: true });
+    await mkdir(join(skillsDir, 'legacy/nested'), { recursive: true });
+    await writeFile(join(skillsDir, 'flat.md'), '# Flat skill');
+    await writeFile(join(skillsDir, 'legacy/nested/legacy.md'), '# Legacy skill');
+    await writeFile(join(skillsDir, 'om-example/SKILL.md'), '# Example skill');
+    await writeFile(join(skillsDir, 'om-example/references/agentic-setup.md'), '# Supporting doc');
+
+    const skills = (await discoverSkills(repoRoot)).filter((skill) => skill.source === 'cezar');
+
+    expect(skills.map((skill) => skill.name)).toEqual(['flat', 'legacy', 'om-example']);
+    expect(skills.some((skill) => skill.name === 'agentic-setup')).toBe(false);
+  });
+
+  it('follows npx-skills directory mirrors and deduplicates them by skill name', async () => {
+    const repoRoot = await mkdtemp(join(tmpdir(), 'cezar-skills-'));
+    tempDirs.push(repoRoot);
+    const canonicalDir = join(repoRoot, '.agents/skills/om-example');
+    const mirrorRoot = join(repoRoot, '.claude/skills');
+    await mkdir(canonicalDir, { recursive: true });
+    await mkdir(mirrorRoot, { recursive: true });
+    await writeFile(join(canonicalDir, 'SKILL.md'), '# Example skill');
+    await symlink('../../.agents/skills/om-example', join(mirrorRoot, 'om-example'), 'dir');
+
+    const skills = (await discoverSkills(repoRoot)).filter((skill) => skill.name === 'om-example');
+
+    expect(skills).toHaveLength(1);
+    expect(skills[0]?.source).toBe('agents');
+  });
+});
+
+describe('parseFrontmatter', () => {
+  it('accepts YAML folded and literal descriptions, BOMs, trailing delimiter whitespace, and quoted arrays', () => {
+    const parsed = parseFrontmatter(
+      '\uFEFF---\n' +
+        'name: "say \\\"hi\\\""\n' +
+        "quote: 'it''s fine'\n" +
+        'description: >\n' +
+        '  Use when: the build fails\n' +
+        '  and needs investigation.\n' +
+        'literal: |\n' +
+        '  Line one.\n' +
+        '  Line two.\n' +
+        'tags: ["a, b", c]\n' +
+        '---   \n' +
+        'Body\n',
+    );
+    expect(parsed.frontmatter.name).toBe('say "hi"');
+    expect(parsed.frontmatter.quote).toBe("it's fine");
+    expect(parsed.frontmatter.description).toBe('Use when: the build fails and needs investigation.\n');
+    expect(parsed.frontmatter.literal).toBe('Line one.\nLine two.\n');
+    expect(parsed.frontmatter.tags).toEqual(['a, b', 'c']);
+    expect(parsed.body).toBe('Body\n');
+  });
+
+  it('keeps legacy scalar spelling and per-key fallback for unsupported YAML values', () => {
+    const parsed = parseFrontmatter(
+      '---\n' +
+        'name: 0042\n' +
+        'description: FALSE\n' +
+        'interactive: true\n' +
+        'description2: >\n' +
+        '  folded text\n' +
+        'unsupported: null\n' +
+        '---\nBody',
+    );
+    expect(parsed.frontmatter.name).toBe('0042');
+    expect(parsed.frontmatter.description).toBe('FALSE');
+    expect(parsed.frontmatter.interactive).toBe(true);
+    expect(parsed.frontmatter.description2).toBe('folded text\n');
+    expect(parsed.frontmatter.unsupported).toBe('null');
+  });
+
+  it.each(['42', 'true', '0042', 'FALSE', 'null'])('keeps legacy description spelling for %s', (value) => {
+    const parsed = parseFrontmatter(`---\ndescription: ${value}\n---\nBody`);
+    expect(parsed.frontmatter.description).toBe(value);
+  });
+
+  it('accepts both YAML boolean and legacy string forms of interactive', () => {
+    expect(parseFrontmatter('---\ninteractive: true\n---\n').frontmatter.interactive).toBe(true);
+    expect(parseFrontmatter("---\ninteractive: 'true'\n---\n").frontmatter.interactive).toBe('true');
+  });
+
+  it('falls back to the legacy parser for unquoted colon-space values', () => {
+    const parsed = parseFrontmatter('---\ndescription: Use when: the build fails\n---\nBody');
+    expect(parsed.frontmatter.description).toBe('Use when: the build fails');
+    expect(parsed.body).toBe('Body');
+  });
+});
+
+/**
+ * The one skill cezar ships itself (spec 2026-09-13-automations-from-prompt): listed only on a
+ * cockpit that has automations on AND publishes a transport, and shadowed by a repo skill of the
+ * same name — the same "user's repo is the source of truth" rule every other source follows.
+ */
+describe('the built-in create-cezar-automation skill', () => {
+  const saved: Record<string, string | undefined> = {};
+  beforeEach(() => {
+    saved.CEZ_AUTOMATIONS = process.env.CEZ_AUTOMATIONS;
+    saved.CEZ_API_URL = process.env.CEZ_API_URL;
+  });
+  afterEach(() => {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  });
+
+  async function emptyRepo(): Promise<string> {
+    const repoRoot = await mkdtemp(join(tmpdir(), 'cezar-skills-'));
+    tempDirs.push(repoRoot);
+    // A repo that names its own skills repos gates nothing and clones nothing here — the
+    // team cache is empty in a fresh process, so the catalog is exactly the local + built-in set.
+    await mkdir(join(repoRoot, '.ai/cezar'), { recursive: true });
+    return repoRoot;
+  }
+
+  it('is absent with automations opted out, and absent by default with no cockpit to reach', async () => {
+    const repoRoot = await emptyRepo();
+    process.env.CEZ_AUTOMATIONS = '0';
+    process.env.CEZ_API_URL = 'http://127.0.0.1:4321';
+    expect((await discoverSkills(repoRoot)).some((s) => s.name === 'create-cezar-automation')).toBe(false);
+    delete process.env.CEZ_AUTOMATIONS;
+    delete process.env.CEZ_API_URL;
+    expect((await discoverSkills(repoRoot)).some((s) => s.name === 'create-cezar-automation')).toBe(false);
+  });
+
+  it('lists as a builtin, interactive skill when automations are on (the default) and reachable', async () => {
+    const repoRoot = await emptyRepo();
+    delete process.env.CEZ_AUTOMATIONS;
+    process.env.CEZ_API_URL = 'http://127.0.0.1:4321';
+    const skill = (await discoverSkills(repoRoot)).find((s) => s.name === 'create-cezar-automation');
+    expect(skill).toMatchObject({ source: 'builtin', interactive: true, path: 'builtin:create-cezar-automation' });
+    expect(skill?.body).toContain('cez automation');
+  });
+
+  it('is shadowed by a repo skill of the same name', async () => {
+    const repoRoot = await emptyRepo();
+    process.env.CEZ_AUTOMATIONS = '1';
+    process.env.CEZ_API_URL = 'http://127.0.0.1:4321';
+    await mkdir(join(repoRoot, '.ai/skills'), { recursive: true });
+    await writeFile(join(repoRoot, '.ai/skills/create-cezar-automation.md'), '---\nname: create-cezar-automation\n---\nHouse version');
+    const matches = (await discoverSkills(repoRoot)).filter((s) => s.name === 'create-cezar-automation');
+    expect(matches).toHaveLength(1);
+    expect(matches[0]).toMatchObject({ source: 'ai', body: 'House version' });
+  });
+});
+
+/** The bundled skill directory (spec 2026-10-22-html-artifacts-and-impact Q6). */
+describe('built-in skill directory', () => {
+  async function repo(): Promise<string> {
+    const repoRoot = await mkdtemp(join(tmpdir(), 'cez-skills-bundled-'));
+    tempDirs.push(repoRoot);
+    await mkdir(join(repoRoot, '.ai/cezar'), { recursive: true });
+    // No team repos: nothing is cloned in the background.
+    await writeFile(join(repoRoot, '.ai/cezar/config.json'), '{"skillsRepos": []}');
+    return repoRoot;
+  }
+
+  it('ships change-impact, resolved from the package (src under tsx, dist when installed)', async () => {
+    expect(BUILTIN_SKILLS_DIR.replace(/\\/g, '/')).toMatch(/\/packages\/cezar\/skills\/$|\/cezar\/skills\/$/);
+    const skill = (await discoverSkills(await repo())).find((s) => s.name === 'change-impact');
+    expect(skill).toMatchObject({ source: 'builtin', path: join(BUILTIN_SKILLS_DIR, 'change-impact', 'SKILL.md') });
+    expect(skill?.body).toContain('cez impact render');
+  });
+
+  it('has the LOWEST precedence: a user copy anywhere wins', async () => {
+    const repoRoot = await repo();
+    const bundled = await mkdtemp(join(tmpdir(), 'cez-skills-pkg-'));
+    tempDirs.push(bundled);
+    await mkdir(join(bundled, 'change-impact'), { recursive: true });
+    await writeFile(join(bundled, 'change-impact/SKILL.md'), '---\nname: change-impact\n---\nShipped');
+    await writeFile(join(bundled, 'only-shipped.md'), '---\nname: only-shipped\n---\nShipped too');
+    await mkdir(join(repoRoot, '.agents/skills/change-impact'), { recursive: true });
+    await writeFile(join(repoRoot, '.agents/skills/change-impact/SKILL.md'), '---\nname: change-impact\n---\nHouse');
+    const skills = await discoverSkills(repoRoot, bundled);
+    const impact = skills.filter((s) => s.name === 'change-impact');
+    expect(impact).toHaveLength(1);
+    expect(impact[0]).toMatchObject({ source: 'agents', body: 'House' });
+    expect(skills.find((s) => s.name === 'only-shipped')).toMatchObject({ source: 'builtin' });
+  });
+
+  it('a missing package dir is an empty tier, never an error', async () => {
+    const skills = await discoverSkills(await repo(), join(tmpdir(), 'cez-no-such-skills-dir'));
+    expect(skills.some((s) => s.name === 'change-impact')).toBe(false);
+  });
+});
+
+describe('project commands (spec 2026-11-05-project-slash-commands)', () => {
+  async function repoWith(files: Record<string, string>): Promise<string> {
+    const root = await mkdtemp(join(tmpdir(), 'cez-commands-'));
+    tempDirs.push(root);
+    for (const [rel, text] of Object.entries(files)) {
+      await mkdir(join(root, rel, '..'), { recursive: true });
+      await writeFile(join(root, rel), text, 'utf8');
+    }
+    return root;
+  }
+  const builtin = join(tmpdir(), 'cez-no-builtin-skills');
+
+  it('lists a spec-kit command as a project command named after its file', async () => {
+    const root = await repoWith({ '.claude/commands/speckit.specify.md': '---\ndescription: Specify\n---\nDo $ARGUMENTS' });
+    const found = (await discoverSkills(root, builtin)).find((s) => s.name === 'speckit.specify');
+    expect(found).toMatchObject({ kind: 'command', source: 'agents', description: 'Specify', body: 'Do $ARGUMENTS' });
+    expect(found?.variants).toEqual([{ runner: 'claude', path: join(root, '.claude/commands/speckit.specify.md') }]);
+  });
+
+  it('lets a built-in skill beat a same-named command', async () => {
+    const root = await repoWith({ '.claude/commands/change-impact.md': 'command' });
+    const found = (await discoverSkills(root)).find((s) => s.name === 'change-impact');
+    expect(found?.kind).toBeUndefined();
+  });
+
+  it('only counts *.prompt.md under .github/prompts', async () => {
+    const root = await repoWith({
+      '.github/prompts/README.md': 'docs',
+      '.github/prompts/review.prompt.md': 'review it',
+    });
+    const names = (await discoverSkills(root, builtin)).filter((s) => s.kind === 'command').map((s) => s.name);
+    expect(names).toEqual(['review']);
+  });
+
+  it('keeps one entry per name with a variant per agent, and a real skill wins', async () => {
+    const root = await repoWith({
+      '.claude/commands/review.md': 'claude body',
+      '.codex/prompts/review.md': 'codex body',
+      '.github/prompts/review.prompt.md': 'copilot body',
+      '.ai/skills/plan.md': 'real skill',
+      '.claude/commands/plan.md': 'command',
+    });
+    const all = await discoverSkills(root, builtin);
+    const review = all.find((s) => s.name === 'review');
+    expect(all.filter((s) => s.name === 'review')).toHaveLength(1);
+    expect(review?.body).toBe('claude body');
+    expect(review?.variants?.map((v) => v.runner)).toEqual(['claude', 'codex', 'copilot']);
+    expect(all.find((s) => s.name === 'plan')).toMatchObject({ body: 'real skill', source: 'ai' });
+    expect(all.find((s) => s.name === 'plan')?.kind).toBeUndefined();
+  });
+});
+
+describe('layerSkillExtensions (repo extensions of shared skills)', () => {
+  const skill = (name: string, source: Skill['source'], body: string): Skill => ({
+    name, source, body, path: `/${source}/${name}/SKILL.md`,
+  });
+  const winner = (lists: Skill[][], pool: Skill[] = []) => layerSkillExtensions(lists, pool).flat()[0];
+
+  it('a declared extension becomes the shared skill, carrying the extension', () => {
+    const local = skill('om-x', 'ai', 'I extend the shared `om-x` skill with stricter verdicts.');
+    const shared = skill('om-x', 'team', 'Workflow. Apply `.ai/skills/om-x/SKILL.md` when present.');
+    expect(winner([[local], [shared]])).toMatchObject({ source: 'team', body: shared.body, extension: { path: local.path } });
+  });
+
+  it('an extension that says it extends the shared skill layers too, from the ungated team pool', () => {
+    const local = skill('om-x', 'ai', 'This file extends the shared `om-x` skill.');
+    // Curated out of the picker (absent from the lists) is still installed.
+    expect(winner([[local]], [skill('om-x', 'team', 'Workflow.')])).toMatchObject({ source: 'team', extension: { path: local.path } });
+  });
+
+  it('a repo skill extending some other shared thing is not an extension of a shared skill', () => {
+    const local = skill('button-rules', 'ai', 'Use when a change extends the shared Button component.');
+    expect(winner([[local]])).toBe(local);
+    // Naming another skill is not naming itself either.
+    expect(winner([[skill('om-x', 'ai', 'This file extends the shared `om-xy` skill.')]])?.missingShared).toBeUndefined();
+  });
+
+  it('a plain repo override still wins when the shared skill documents the extension path', () => {
+    const local = skill('om-x', 'ai', 'My own version.');
+    const shared = skill('om-x', 'team', 'Workflow. Apply `.ai/skills/om-x/SKILL.md` when present.');
+    expect(winner([[local], [shared]])).toBe(local);
+  });
+
+  it('an extension with no shared skill is flagged, never posing as it', () => {
+    const local = skill('om-x', 'ai', 'Repo-local extension of the shared `om-x` skill.');
+    // The `.agents/skills` mirror of the same file is not a shared copy.
+    expect(winner([[local], [skill('om-x', 'agents', local.body)]])).toMatchObject({ source: 'ai', missingShared: true });
+  });
+
+  it('discoverSkills resolves an Open Mercato-style override to the installed shared skill', async () => {
+    const repo = await mkdtemp(join(tmpdir(), 'cez-skill-ext-'));
+    tempDirs.push(repo);
+    await mkdir(join(repo, '.ai/skills/om-y'), { recursive: true });
+    await writeFile(
+      join(repo, '.ai/skills/om-y/SKILL.md'),
+      '---\nname: om-y\ndescription: Repo-local extension of the shared `om-y` skill.\n---\nRules.\n',
+    );
+    await mkdir(join(repo, '.agents/skills/om-y'), { recursive: true });
+    await writeFile(join(repo, '.agents/skills/om-y/SKILL.md'), '---\nname: om-y\n---\nShared workflow.\n');
+    const found = (await discoverSkills(repo)).find((s) => s.name === 'om-y');
+    expect(found).toMatchObject({ source: 'agents', extension: { path: join(repo, '.ai/skills/om-y/SKILL.md') } });
+    expect(found?.body).toContain('Shared workflow.');
+  });
+});

@@ -1,0 +1,143 @@
+import { hashKey, useQueryClient } from '@tanstack/react-query'
+import { useEffect, useRef } from 'react'
+import { useNavigate, type NavigateFunction } from 'react-router'
+
+import { queryKeys, useWorkspaceUiState } from '@/api/queries'
+import { managerKeys } from '@/api/managers'
+import { getApiScope, type ApiRun, type HealthResponse, type ManagerListResponse, type RunStatus } from '@open-mercato/cezar-api-client'
+import { scopeTo } from '@/lib/project-router'
+import { managerNotificationKind, trackManagerNotificationClicked } from '@/lib/manager-telemetry'
+import {
+  describeDiskGuardNotification,
+  describeManagerNotification,
+  diffManagerAttention,
+  enteringDiskGuardWarning,
+  diffRunTransitions,
+  normalizeNotifications,
+  notificationSupport,
+  shouldNotify,
+  describeRunNotification,
+  type RunNotificationContent,
+} from '@/lib/notifications'
+
+/**
+ * The notification trigger (R6 Step 1.7, spec §"Cross-cutting"): browser `Notification` when a
+ * run ENTERS `waiting`/`review`/failed while the tab is hidden.
+ *
+ * It watches the cached run list rather than opening its own listener on `/api/events`: the
+ * global stream (api/global-events.tsx) already folds every `run` event into
+ * `queryKeys.runs.list()`, and the reconnect/visibility reconciliation refetches it — so one
+ * cache subscription sees BOTH deliveries of the same truth. That second path is not a bonus,
+ * it is the point: a hidden tab is exactly when the stream is most likely to have been frozen
+ * (mobile background freeze, laptop lid), and the run that flipped to `waiting` while the socket
+ * was dead arrives via the reconciling refetch, not via an event.
+ *
+ * Statuses are tracked UNCONDITIONALLY — before the enabled/hidden/permission gate — so flipping
+ * the toggle on later, or refocusing the tab, never replays transitions that already happened:
+ * the gate decides whether a transition becomes a notification, never whether it was observed.
+ *
+ * Renders nothing. Mounted once in app.tsx, inside the router so a click can navigate, for the
+ * app's whole life.
+ */
+export function RunNotifications() {
+  const queryClient = useQueryClient()
+  const navigate = useNavigate()
+  // A ref so a navigate identity change never rebuilds the subscription (and its status map).
+  const navigateRef = useRef(navigate)
+  navigateRef.current = navigate
+  // The toggle, straight from the GLOBAL ui-state (step 3.5 moved the section there — the
+  // notifying browser is one browser whichever project is open). Read through the same query
+  // AppearanceProvider keeps warm — no extra fetch, and a PUT from Settings updates this cache
+  // entry, so the gate flips without any coupling between the two components.
+  const uiState = useWorkspaceUiState()
+  const enabled = normalizeNotifications(uiState.data?.notifications).enabled
+
+  // A ref, not an effect dependency: re-running the effect on toggle flips would rebuild the
+  // cache subscription and lose the status map — the whole "never replay" guarantee.
+  const enabledRef = useRef(enabled)
+  enabledRef.current = enabled
+  const statusesRef = useRef<ReadonlyMap<string, RunStatus>>(new Map())
+  const managerCountsRef = useRef<ReadonlyMap<string, number> | null>(null)
+  const diskGuardRef = useRef<string | null | undefined>(undefined)
+
+  useEffect(() => {
+    // The watched list belongs to the project scoped at mount; its runs open under that project (#1761).
+    const projectId = getApiScope()
+    const listHash = hashKey(queryKeys.runs.list())
+    const managersHash = hashKey(managerKeys.list)
+    const healthHash = hashKey(queryKeys.health)
+
+    // Same terms as runs: tracked before the gate, seeded silently from the first list.
+    const observeManagers = (list: ManagerListResponse | undefined): void => {
+      if (!list) return
+      const { entering, counts } = diffManagerAttention(managerCountsRef.current, list.managers)
+      managerCountsRef.current = counts
+      // The server raises the OS's own here, tab or no tab; a second one would be a double. Read
+      // from the cache, not a render, so a change landing in the same tick still counts.
+      const system = queryClient.getQueryData<HealthResponse>(queryKeys.health)?.capabilities.managerSystemNotifications === true
+      if (entering.length === 0 || system || !notificationsAllowed()) return
+      for (const manager of entering) {
+        const kind = managerNotificationKind(manager)
+        fireNotification(describeManagerNotification(manager), navigateRef.current, () => trackManagerNotificationClicked(kind))
+      }
+    }
+    const notificationsAllowed = () => shouldNotify({
+      enabled: enabledRef.current,
+      hidden: document.visibilityState === 'hidden',
+      permission: notificationSupport(),
+    })
+
+    // The disk guard's warning (spec 2026-11-19-worktree-disk-usage): health carries it, once.
+    const observeHealth = (health: HealthResponse | undefined): void => {
+      if (!health) return
+      const entering = enteringDiskGuardWarning(diskGuardRef.current, health)
+      diskGuardRef.current = health.disk?.guardWarning ?? null
+      if (entering && notificationsAllowed()) fireNotification(describeDiskGuardNotification(entering), navigateRef.current)
+    }
+
+    const observe = (runs: readonly ApiRun[] | undefined): void => {
+      const { entering, statuses } = diffRunTransitions(statusesRef.current, runs)
+      statusesRef.current = statuses
+      if (entering.length === 0 || !notificationsAllowed()) return
+      for (const run of entering) {
+        const content = describeRunNotification(run)
+        fireNotification({ ...content, path: scopeTo(projectId, `/tasks/${encodeURIComponent(run.id)}`) }, navigateRef.current)
+      }
+    }
+
+    // Seed from whatever the cache already holds: with an empty previous map nothing can
+    // "enter", so a mount mid-session records the current statuses and stays silent.
+    observe(queryClient.getQueryData<ApiRun[]>(queryKeys.runs.list()))
+    observeManagers(queryClient.getQueryData<ManagerListResponse>(managerKeys.list))
+    observeHealth(queryClient.getQueryData<HealthResponse>(queryKeys.health))
+
+    return queryClient.getQueryCache().subscribe((event) => {
+      if (event.type !== 'updated') return
+      if (event.query.queryHash === listHash) observe(event.query.state.data as ApiRun[] | undefined)
+      else if (event.query.queryHash === managersHash) observeManagers(event.query.state.data as ManagerListResponse | undefined)
+      else if (event.query.queryHash === healthHash) observeHealth(event.query.state.data as HealthResponse | undefined)
+    })
+  }, [queryClient])
+
+  return null
+}
+
+/** The impure sliver: construct the `Notification`. Guarded and try/caught because both failure
+ *  modes are real — no constructor at all (tests, old WebViews), and a constructor that THROWS
+ *  on page-context construction (Chrome on Android insists on a ServiceWorker). A notification
+ *  is a courtesy; it must never take the message loop down with it. */
+function fireNotification(content: RunNotificationContent, navigate: NavigateFunction, onClicked?: () => void): void {
+  const N = globalThis.Notification
+  if (typeof N !== 'function') return
+  try {
+    const notification = new N(content.title, { body: content.body, tag: content.tag })
+    notification.onclick = () => {
+      onClicked?.()
+      window.focus()
+      navigate(content.path)
+      notification.close()
+    }
+  } catch {
+    // Degrade silently — the dot in the quick-list still tells the truth.
+  }
+}

@@ -1,24 +1,21 @@
 {
-  "name": "@azuron/contract",
-  "version": "0.1.0",
-  "description": "Zod data contracts and shared types for AZURON",
+  "name": "@open-mercato/cezar-contract",
+  "version": "0.21.0",
+  "description": "The cezar HTTP API contract: zod schemas and the types inferred from them.",
+  "license": "MIT",
   "type": "module",
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
   "exports": {
-    ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
-    }
+    ".": "./src/index.ts",
+    "./package.json": "./package.json"
   },
+  "files": [
+    "src"
+  ],
   "scripts": {
-    "build": "node ../../node_modules/typescript/bin/tsc",
-    "typecheck": "node ../../node_modules/typescript/bin/tsc --noEmit"
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "zod": "^3.23.8"
+    "zod": "^4.6.7"
   },
-  "devDependencies": {
-    "typescript": "^5.6.3"
-  }
+  "private": true
 }

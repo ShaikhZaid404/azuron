@@ -1,0 +1,1343 @@
+import { spawn as nodeSpawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { realpathSync } from 'node:fs';
+import { createServer } from 'node:net';
+import { basename, dirname, join, resolve, sep } from 'node:path';
+import { randomBytes } from 'node:crypto';
+import type {
+  AgentEvent,
+  AgentRunResult,
+  AgentRunSpec,
+  AgentRunner,
+  AgentToolCallRecord,
+  ContentBlock,
+} from './agent-runner.ts';
+import type { AgentSession, SessionOptions } from './agent-runner.ts';
+import {
+  assertReasoningEffortSupported,
+  prependSystemPrompt,
+  trackChildExit,
+} from './agent-runner.ts';
+import { buildChildEnv } from './agent-env.ts';
+import { resolveOpencodeExecutable } from './opencode-model-catalog.ts';
+import { agentTmpDir } from '../runs/agent-tmpdir.ts';
+import { provisionedLinkTargets } from '../skills-provision.ts';
+import { disclaimedCommand } from './disclaim-spawn.ts';
+import { signalServer, trackServer } from './opencode-server-registry.ts';
+import { AUTO_END_DELAY_MS, DEFAULT_RUN_TIMEOUT_MS } from './claude-cli-runner.ts';
+import { parseModelIdentity } from './model-identity.ts';
+import { parseAskRequest, type AskQuestion } from './ask.ts';
+import { userInputAnswers } from './codex-app-server-runner.ts';
+import { V1TextCoalescer } from './v1-text-coalescer.ts';
+import { OpencodeV2Events } from './opencode-v2-events.ts';
+import {
+  OpencodeTransportError,
+  openOpencodeEventStream,
+  opencodeRequest,
+} from './opencode-http.ts';
+import {
+  createOpencodeUiState,
+  mapOpencodeEvent,
+  opencodeImageAttachments,
+  opencodeSessionStarted,
+  opencodeTurnStarted,
+  type OpencodeUiMapperState,
+  type OpencodeUiMapping,
+} from './opencode-ui-mapper.ts';
+import { opencodeConfigContent, opencodeReadOnlyConfig } from './private-mcp.ts';
+import { armInactivityDeadline, inactivityTimeoutMessage, type InactivityDeadline } from './inactivity-deadline.ts';
+
+export interface OpencodeRunnerOptions {
+  /** Override the binary name/path; defaults to `opencode` on PATH. */
+  bin?: string;
+  /** Inactivity timeout for a run (ms); per-spec `timeoutMs` still wins. */
+  timeoutMs?: number;
+}
+
+/** Startup fails after this long with no sign of life — re-armed by any output,
+ *  so a server busy with a one-time migration is not killed mid-way. */
+export const SERVER_START_TIMEOUT_MS = 30_000;
+/** Hard cap on startup however chatty the server is. */
+export const SERVER_START_MAX_MS = 180_000;
+/** How often the port cezar asked for is probed while waiting for the URL line. */
+export const SERVER_PROBE_INTERVAL_MS = 500;
+/** Spawns per session before a taken port is fatal (see `listen()`). */
+export const SERVER_PORT_ATTEMPTS = 3;
+
+/** Grace between the teardown SIGTERM and the SIGKILL that follows it. */
+export const KILL_GRACE_MS = 4_000;
+
+/**
+ * How long a turn waits for a `session.idle` that never comes, once the prompt
+ * POST has settled and the event bus has gone quiet.
+ *
+ * `session.idle` is the turn boundary (#897), and the window below is the
+ * transition out of the state that signal would otherwise be the only exit
+ * from: an opencode build that does not emit it still ends its turn. Every
+ * `message.*` frame re-arms the window, so a session that is genuinely working
+ * — the case this whole fix is about — never trips it. This is NOT the
+ * agent-step inactivity deadline (#880, cf2191f1); that deadline is untouched.
+ */
+export const TURN_IDLE_GRACE_MS = 5_000;
+
+/**
+ * A `session.status` retry scheduled further out than this ends the turn as an error. OpenCode
+ * retries a refused prompt silently on its own schedule — a spent free tier until the next day —
+ * and an interactive step has no wall clock, so four runs held their slots for 11 h. A duration,
+ * not a clock time: `next` is an epoch instant, so the resume it books is zone-independent.
+ */
+export const RETRY_GIVE_UP_MS = 10 * 60_000;
+
+/** `action.reason`s that mean a spent quota — OpenCode 1.19 sends `free_tier_limit` and
+ *  `account_rate_limit`. Any other action still fails the turn, but books no auto-resume. */
+const QUOTA_REASON_RE = /limit|quota/i;
+
+/**
+ * `AgentRunner` over `opencode serve` — a headless HTTP server (the same one
+ * the opencode TUI talks to) with an SSE event stream. One server per session,
+ * bound to the run's `cwd` (worktree), gives OpenCode the same multi-turn shape
+ * as the Claude runner: each `sendMessage` posts another prompt to the same
+ * session (history is kept server-side) and `session/abort` cancels. "Continue"
+ * starts a fresh server and a fresh session — `bootstrap()` always `POST
+ * /session` and does not read `spec.sessionId`; resuming a server-side session
+ * id is not implemented.
+ *
+ * Auth = the host's opencode config/logins. A permission prompt for this run's
+ * own state is granted by the runner (`opencodePermissionReply`); any other one
+ * becomes an ask card when a human can answer it (`canAskPermission`, #2042)
+ * and is refused otherwise — autonomous, headless and one-shot runs. OpenCode has no per-tool allowlist, so
+ * `spec.allowedTools` is ignored. `spec.model` is `provider/model`.
+ */
+export class OpencodeServerRunner implements AgentRunner {
+  readonly backend = 'opencode' as const;
+
+  private readonly bin: string;
+  private readonly timeoutMs: number;
+  private readonly sessions = new Set<OpencodeSession>();
+
+  constructor(opts: OpencodeRunnerOptions = {}) {
+    this.bin = resolveOpencodeExecutable(opts.bin);
+    this.timeoutMs = opts.timeoutMs ?? DEFAULT_RUN_TIMEOUT_MS;
+  }
+
+  run(spec: AgentRunSpec, onEvent?: (event: AgentEvent) => void): Promise<AgentRunResult> {
+    return this.startSession(spec, onEvent, { autoEndAfterFirstTurn: true }).result;
+  }
+
+  async interrupt(): Promise<void> {
+    for (const session of [...this.sessions]) session.interrupt();
+  }
+
+  startSession(
+    spec: AgentRunSpec,
+    onEvent?: (event: AgentEvent) => void,
+    opts: SessionOptions = {},
+  ): AgentSession {
+    assertReasoningEffortSupported('opencode', spec.reasoningEffort);
+    const session = new OpencodeSession(this.bin, this.timeoutMs, spec, onEvent, opts);
+    this.sessions.add(session);
+    void session.result.then(
+      () => this.sessions.delete(session),
+      () => this.sessions.delete(session),
+    );
+    return session;
+  }
+}
+
+/** The server answered with a non-2xx status — an answer, unlike `OpencodeTransportError`. */
+class OpencodeStatusError extends Error {
+  constructor(readonly status: number, message: string) {
+    super(message);
+    this.name = 'OpencodeStatusError';
+  }
+}
+
+/** No session id in the text: the store's secret redaction would print it as `[REDACTED]`. */
+const OPENCODE_MISSING_SESSION = 'opencode no longer has the session this task resumes';
+
+/** True only for the runner's own "reopen answered 404" error — never a URL that merely names a session. */
+export function isOpencodeMissingSessionError(message: string): boolean {
+  return message.includes(OPENCODE_MISSING_SESSION);
+}
+
+/** The server answered neither the 2.x `/api/info` probe nor the 1.x session route (#1513). */
+export function unsupportedServerMessage(status: number): string {
+  return (
+    `this OpenCode server has no POST /session route (HTTP ${status}) and did not identify itself ` +
+    'as OpenCode 2.x on GET /api/info — update OpenCode to a 1.x or 2.x release cezar can drive.'
+  );
+}
+
+/** One live `opencode serve` process driving a single session. */
+class OpencodeSession implements AgentSession {
+  readonly result: Promise<AgentRunResult>;
+
+  private child!: ChildProcessWithoutNullStreams;
+  private serverPort!: number;
+  /** "Has the server actually terminated?" — never `child.killed`, which only
+   *  reports delivery and would disarm the escalation (#844/#858). */
+  private hasExited!: () => boolean;
+  private closed!: Promise<void>;
+  private stderrChunks: string[] = [];
+  private serverOpen = true;
+  private stopped = false;
+  private baseUrl: string | undefined;
+  private sessionId: string | undefined;
+  private apiVersion: 1 | 2 = 1;
+  private v2Events: OpencodeV2Events | undefined;
+  private readonly headers: Record<string, string>;
+  private readonly password: string;
+  private turnGeneration = 0;
+  private ready!: Promise<void>;
+  private exited!: Promise<void>;
+  private readonly sse = new AbortController();
+  private readonly toolCalls: AgentToolCallRecord[] = [];
+  private readonly textChunks: string[] = [];
+  /** Per text-part cursor so only newly-appended text is buffered (deltas). */
+  private readonly textSeen = new Map<string, number>();
+  /** Streamed part deltas buffered per part — v1 `text` is emitted once per
+   *  finished part (claude parity: one event per complete block), never per
+   *  delta, so the persisted transcript and the headless CLI get whole
+   *  paragraphs. Streaming display rides protocol v2's `item.delta`. */
+  private readonly textCoalescer = new V1TextCoalescer((text) => {
+    this.textChunks.push(text);
+    this.emit({ type: 'text', text });
+  });
+  private readonly toolsSeen = new Set<string>();
+  private readonly imagesEmitted = new Set<string>();
+  private readonly permissionsAnswered = new Set<string>();
+  /** Permission prompts waiting on the user, oldest first; the head is the one on the card (#2042). */
+  private readonly pendingPermissions: Array<{ id: string; props: Record<string, unknown> }> = [];
+  /** The native `question` tool call the session is blocked on; the next user message answers it (#1652). */
+  private pendingQuestion: { id: string; questions: AskQuestion[] } | undefined;
+  private readonly v1UsageByMessage = new Map<string, { tokens: number; cost: number }>();
+  private readonly v2UsageByMessage = new Map<string, { tokens: number; cost: number }>();
+  /** messageID → role. Parts carry no role; only assistant parts are surfaced
+   *  (the user's own message also streams as parts over the same SSE feed). */
+  private readonly msgRole = new Map<string, string>();
+  private tokensUsed = 0;
+  private lastCost: number | undefined;
+  private turnInFlight = false;
+  /** Has this turn's prompt POST settled (either way)? Until it has, nothing
+   *  synthesizes a turn end — only the wire does. */
+  private turnPostSettled = false;
+  /** Resolves the in-flight turn's `prompt()` — called from `finishTurn()`. */
+  private endTurn: (() => void) | undefined;
+  private turnGraceTimer: NodeJS.Timeout | undefined;
+  /** A transport drop swallowed during this turn (#897), kept so a turn that
+   *  then ends WITHOUT a `session.idle` still reports it. Dropping the POST is
+   *  no evidence on its own; dropping it AND never hearing the session finish
+   *  is, and that must not disappear along with the false "Needs you". */
+  private turnDropped: string | undefined;
+  /** Did the SSE subscription ever connect, and is it still open? Together
+   *  they answer "does the event bus still show a live session?" — the
+   *  question that decides whether a dropped prompt POST means anything. */
+  private sseConnected = false;
+  private sseClosed = false;
+  /** Protocol v2 emission — additive alongside v1 (`onEvent` keeps flowing
+   *  byte-identical); the channel is `opts.onUiEvent` (RunManager wiring
+   *  lands in R2 step 2.1). Both streams now take their turn end from the wire
+   *  `session.idle`; v1's used to be synthesized from the HTTP response. */
+  private uiState: OpencodeUiMapperState = createOpencodeUiState();
+  private autoEndTimer: NodeJS.Timeout | undefined;
+  private spawnFailed: Error | null = null;
+  private timedOut = false;
+  private deadline: InactivityDeadline = armInactivityDeadline(0, () => {});
+  /** Set once `giveUpOnLongRetry` has reported the failure — the held POST's hang-up is not news. */
+  private retryGaveUp = false;
+  /** One teardown per session — see `terminate()`. */
+  private signalled = false;
+
+  constructor(
+    private readonly bin: string,
+    timeoutMs: number,
+    private readonly spec: AgentRunSpec,
+    private readonly onEvent: ((event: AgentEvent) => void) | undefined,
+    private readonly opts: SessionOptions,
+  ) {
+    // Both APIs support Basic auth. Own credentials for this private child,
+    // never the shared service's registration or a user-authored config file.
+    this.password = randomBytes(32).toString('hex');
+    this.headers = { authorization: `Basic ${Buffer.from(`opencode:${this.password}`).toString('base64')}` };
+    this.spawnServer(randomServerPort());
+    const urlReady = this.listen();
+
+    const limitMs = spec.timeoutMs ?? timeoutMs;
+    this.deadline = armInactivityDeadline(limitMs, () => {
+      this.timedOut = true;
+      this.interrupt();
+    });
+
+    this.ready = (async () => {
+      this.baseUrl = await urlReady;
+      await this.detectApiVersion();
+      await this.bootstrap();
+    })();
+
+    this.result = (async (): Promise<AgentRunResult> => {
+      try {
+        await this.ready;
+        // Live for the whole session; the SSE loop runs until end()/interrupt.
+        await this.exited;
+      } catch (err) {
+        // `stopped`, not `serverOpen`: a child that exits on its own also closes the server (#1396).
+        if (!this.timedOut && !this.retryGaveUp && !this.stopped) {
+          const message = err instanceof Error ? err.message : String(err);
+          this.emit({ type: 'error', message: `opencode: ${message}` });
+        }
+      } finally {
+        this.deadline.clear();
+        if (this.autoEndTimer) clearTimeout(this.autoEndTimer);
+        this.sse.abort();
+        this.serverOpen = false;
+        this.terminate();
+      }
+
+      await this.exited;
+      if (this.spawnFailed) throw this.spawnFailed;
+
+      // Timeout/interrupt can cut the SSE feed mid-part — recover buffered prose.
+      this.textCoalescer.flush();
+      // Chunks are whole blocks now (one per finished part), so newline-join
+      // like the other runners, not the old delta concatenation.
+      const text = this.textChunks.join('\n').trim();
+      const base: AgentRunResult = {
+        text,
+        toolCalls: this.toolCalls,
+        tokensUsed: this.tokensUsed,
+        sessionId: this.sessionId ?? spec.sessionId,
+      };
+      if (this.timedOut) {
+        this.emit({ type: 'error', message: inactivityTimeoutMessage('opencode', limitMs, this.deadline.expiredBy) });
+      }
+      this.emit({ type: 'done' });
+      return base;
+    })();
+  }
+
+  get open(): boolean {
+    return this.serverOpen;
+  }
+
+  get pid(): number | undefined {
+    return this.child.pid;
+  }
+
+  sendMessage(content: ContentBlock[]): boolean {
+    if (!this.serverOpen) return false;
+    if (this.autoEndTimer) {
+      clearTimeout(this.autoEndTimer);
+      this.autoEndTimer = undefined;
+    }
+    const text = textOf(content);
+    if (!text) return true;
+    const permission = this.pendingPermissions.shift();
+    if (permission) {
+      // The next card waits for the reply: raised inside this send(), its park would be
+      // overwritten by the caller's own "resumed" write that follows the send.
+      void this.replyPermission(permission.id, permission.props, permissionAnswer(text)).then(() => this.askNextPermission());
+      return true;
+    }
+    if (this.pendingQuestion) {
+      const pending = this.pendingQuestion;
+      this.pendingQuestion = undefined;
+      void this.replyQuestion(pending, text);
+      return true;
+    }
+    void this.ready
+      .then(() => this.prompt(text))
+      .catch((err: unknown) => {
+        if (!this.serverOpen) return;
+        const message = err instanceof Error ? err.message : String(err);
+        this.emit({ type: 'note', message: `opencode: prompt failed: ${message}` });
+      });
+    return true;
+  }
+
+  end(): void {
+    this.stopped = true;
+    if (!this.serverOpen) return;
+    this.serverOpen = false;
+    this.finishTurn();
+    this.sse.abort();
+    this.terminate();
+  }
+
+  interrupt(): void {
+    this.stopped = true;
+    this.serverOpen = false;
+    if (this.baseUrl && this.sessionId) {
+      const path = this.apiVersion === 2 ? `/api/session/${this.sessionId}/interrupt` : `/session/${this.sessionId}/abort`;
+      void this.http('POST', path, undefined).catch(() => undefined);
+    }
+    this.finishTurn();
+    this.sse.abort();
+    this.terminate();
+  }
+
+  hardStop(): void {
+    this.interrupt();
+  }
+
+  /**
+   * The one place either signal is sent: SIGTERM now, SIGKILL once the grace
+   * window elapses.
+   *
+   * Both steps gate on `hasExited()`, never on `child.killed` — the latter
+   * flips the moment SIGTERM is *delivered*, so the old nested
+   * `exitCode == null && !killed` guard disarmed the escalation for exactly the
+   * server it was written for: one that installs its own SIGTERM handler stayed
+   * alive with `killed = true` and `exitCode === null`, outliving the whole
+   * window (#858, the same defect #844 fixed for the other two backends). Every
+   * caller here is followed by `await this.exited`, so a server that survived
+   * SIGTERM did not just leak — it hung the session's result forever.
+   *
+   * One teardown per session: all three call sites can run for the same session
+   * (`interrupt()` on the deadline, then the result promise's `finally`), and
+   * once SIGTERM is out with SIGKILL armed there is nothing a second pass adds.
+   * The old `!child.killed` test deduplicated this as a side effect of being
+   * wrong; `signalled` keeps that property on purpose.
+   */
+  private terminate(): void {
+    if (this.signalled || this.hasExited()) return;
+    this.signalled = true;
+    signalServer(this.child, 'SIGTERM');
+    setTimeout(() => {
+      if (this.hasExited()) return;
+      signalServer(this.child, 'SIGKILL');
+    }, KILL_GRACE_MS).unref?.();
+  }
+
+  // ---- server lifecycle ---------------------------------------------------
+
+  /** Spawn `opencode serve` on `port` and make it the session's server. Every
+   *  handler closes over its own child, so a replaced one cannot end the session. */
+  private spawnServer(port: number): void {
+    let child: ChildProcessWithoutNullStreams;
+    try {
+      const env = buildChildEnv({ backend: 'opencode', extraEnv: this.spec.env });
+      env.OPENCODE_SERVER_PASSWORD = this.password;
+      // V2 prefers this alias over SERVER_PASSWORD; neither may inherit a shared service's credential.
+      env.OPENCODE_PASSWORD = this.password;
+      // Private MCP servers (spec 2026-10-07-private-project-mcp): OpenCode loads
+      // OPENCODE_CONFIG_CONTENT after the project config, so these are added and win on a clash.
+      if (this.spec.mcpServers?.length) {
+        env.OPENCODE_CONFIG_CONTENT = opencodeConfigContent(this.spec.mcpServers, env.OPENCODE_CONFIG_CONTENT);
+      }
+      if (this.spec.enforceReadOnly) env.OPENCODE_CONFIG_CONTENT = opencodeReadOnlyConfig(env.OPENCODE_CONFIG_CONTENT);
+      const [file, argv] = disclaimedCommand(this.bin, ['serve', '--hostname', '127.0.0.1', '--port', String(port)], env);
+      child = nodeSpawn(file, argv, { cwd: this.spec.cwd, env, detached: process.platform !== 'win32' });
+    } catch (err) {
+      throw wrapSpawnError(err, this.bin);
+    }
+    this.child = child;
+    this.serverPort = port;
+    trackServer(child, port);
+    this.hasExited = trackChildExit(child);
+    child.once('exit', () => {
+      this.serverOpen = false;
+    });
+
+    child.on('error', (err: NodeJS.ErrnoException) => {
+      this.spawnFailed = wrapSpawnError(err, this.bin);
+    });
+
+    let resolveExit!: () => void;
+    this.exited = new Promise<void>((resolve) => {
+      resolveExit = resolve;
+    });
+    this.closed = new Promise<void>((resolve) => child.once('close', () => resolve()));
+    // A server that is gone will never send `session.idle`, so the turn ends
+    // here rather than waiting for a signal that cannot arrive.
+    const gone = () => {
+      this.finishTurn();
+      resolveExit();
+    };
+    child.once('exit', gone);
+    child.once('close', gone);
+
+    const stderrChunks: string[] = [];
+    this.stderrChunks = stderrChunks;
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk: string) => stderrChunks.push(chunk));
+  }
+
+  /**
+   * The server's base URL, respawning on a fresh port when the random one was
+   * already taken — it sits in the OS ephemeral range, and opencode 1.19 exits
+   * with a bare `ServeError` instead of picking another (release 0.16.1 CI).
+   */
+  private async listen(): Promise<string> {
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        return await this.waitForServerUrl(this.serverPort);
+      } catch (err) {
+        const retry = attempt < SERVER_PORT_ATTEMPTS && this.hasExited() && (await this.lostPort());
+        if (!retry || this.stopped) {
+          // Local transcript only: the stderr tail can name paths, so it stays
+          // out of the error message that telemetry groups on.
+          const tail = this.stderrChunks.join('').trim().slice(-800);
+          if (tail) this.emit({ type: 'note', message: `opencode serve stderr: ${tail}` });
+          throw err;
+        }
+        this.serverOpen = true;
+        this.spawnServer(randomServerPort());
+      }
+    }
+  }
+
+  /** Did the server that just exited lose its port? Its stderr says so, or the
+   *  port still cannot be bound. */
+  private async lostPort(): Promise<boolean> {
+    // stderr can still be flushing at `exit`; `close` means it is all in.
+    await Promise.race([this.closed, new Promise((resolve) => setTimeout(resolve, 1_000).unref?.())]);
+    if (/EADDRINUSE|address already in use|ServeError/i.test(this.stderrChunks.join(''))) return true;
+    return portTaken(this.serverPort);
+  }
+
+  /**
+   * Resolve the server's base URL from whichever comes first: the URL line on
+   * stdout or stderr, or the port cezar asked for answering `GET /path` with
+   * this run's own directory (#1179 made a missing line fatal; a slow or
+   * differently-worded start must not be). Fails only on exit, on
+   * `SERVER_START_TIMEOUT_MS` of silence, or at `SERVER_START_MAX_MS`.
+   */
+  private waitForServerUrl(port: number): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const probeUrl = `http://127.0.0.1:${port}`;
+      const ownDir = canonicalPath(this.spec.cwd ?? process.cwd());
+      const probeAbort = new AbortController();
+      let buffer = '';
+      let settled = false;
+      const fail = (message: string) => {
+        if (settled) return;
+        cleanup();
+        reject(new Error(message));
+      };
+      const succeed = (url: string) => {
+        if (settled) return;
+        cleanup();
+        resolve(url);
+      };
+      // Fixed messages, never the elapsed time: each distinct string is its own telemetry group.
+      let heardOutput = false;
+      const stallFail = () =>
+        fail(
+          heardOutput
+            ? `opencode serve went silent for ${SERVER_START_TIMEOUT_MS / 1000}s without reporting a listening URL`
+            : `opencode serve did not report a listening URL within ${SERVER_START_TIMEOUT_MS / 1000}s`,
+        );
+      let stall = setTimeout(stallFail, SERVER_START_TIMEOUT_MS);
+      stall.unref?.();
+      const cap = setTimeout(
+        () => fail(`opencode serve did not report a listening URL within ${SERVER_START_MAX_MS / 1000}s`),
+        SERVER_START_MAX_MS,
+      );
+      cap.unref?.();
+      const onData = (chunk: string) => {
+        heardOutput = true;
+        clearTimeout(stall);
+        stall = setTimeout(stallFail, SERVER_START_TIMEOUT_MS);
+        stall.unref?.();
+        buffer = (buffer + chunk).slice(-4096);
+        const m = SERVER_URL_RE.exec(buffer);
+        if (m) succeed(m[0].replace('//localhost:', '//127.0.0.1:'));
+      };
+      const probe = setInterval(() => {
+        void opencodeRequest(`${probeUrl}/path`, { method: 'GET', signal: AbortSignal.any([probeAbort.signal, AbortSignal.timeout(2_000)]) })
+          .then((res) => {
+            if (res.status !== 200) return;
+            const dir = stringField(parseRecord(res.body), 'directory');
+            if (dir && canonicalPath(dir) === ownDir) succeed(probeUrl);
+          })
+          .catch(() => undefined);
+      }, SERVER_PROBE_INTERVAL_MS);
+      probe.unref?.();
+      const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+        // The stderr tail rides a local note in listen(), never this telemetry-grouped message.
+        const detail = code === null ? `signal ${signal ?? 'unknown'}` : `exit code ${code}`;
+        fail(`opencode serve exited before it started listening (${detail})`);
+      };
+      const cleanup = () => {
+        settled = true;
+        clearTimeout(stall);
+        clearTimeout(cap);
+        clearInterval(probe);
+        probeAbort.abort();
+        this.child.stdout.off('data', onData);
+        this.child.stderr.off('data', onData);
+        this.child.off('exit', onExit);
+      };
+      this.child.stdout.setEncoding('utf8');
+      this.child.stdout.on('data', onData);
+      this.child.stderr.on('data', onData);
+      this.child.once('exit', onExit);
+    });
+  }
+
+  private async detectApiVersion(): Promise<void> {
+    const res = await opencodeRequest(`${this.baseUrl}/api/info`, {
+      method: 'GET', headers: this.headers,
+      signal: AbortSignal.any([this.sse.signal, AbortSignal.timeout(10_000)]),
+    });
+    // Legacy servers answer their web shell (or 404) here. Never downgrade a
+    // real auth/server error, and never repeat a state-changing request.
+    if (res.status === 404) return;
+    if (res.status < 200 || res.status >= 300) throw new Error(`GET /api/info → ${res.status}`);
+    let info: unknown;
+    try { info = JSON.parse(res.body); } catch { return; }
+    if (!info || typeof info !== 'object' || !('version' in info) || typeof info.version !== 'string') return;
+    if (/^2\./.test(info.version)) this.apiVersion = 2;
+    else if (!/^1\./.test(info.version)) throw new Error('Unsupported OpenCode server API version');
+  }
+
+  /** Reopens the 1.x session a Continue resumes (#1193); a 404 is the one "it is gone" answer. */
+  private async reopenSession(sessionId: string): Promise<Record<string, unknown>> {
+    let reopened: Record<string, unknown>;
+    try {
+      reopened = await this.http('GET', `/session/${encodeURIComponent(sessionId)}`, undefined);
+    } catch (err) {
+      if (err instanceof OpencodeStatusError && err.status === 404) throw new Error(OPENCODE_MISSING_SESSION);
+      throw err;
+    }
+    if (stringField(reopened, 'id') !== sessionId) throw new Error(OPENCODE_MISSING_SESSION);
+    return reopened;
+  }
+
+  private async bootstrap(): Promise<void> {
+    // Only 1.x is reopened: a 2.x resume still starts a new session, as before.
+    const resumeId = this.spec.resume && this.apiVersion === 1 ? this.spec.sessionId : undefined;
+    if (resumeId) await this.openSession(await this.reopenSession(resumeId));
+    else await this.openSession(await this.createSession());
+    await this.prompt(resumeId ? this.spec.userPrompt : prependSystemPrompt(this.spec.systemPrompt, this.spec.userPrompt));
+  }
+
+  private async createSession(): Promise<Record<string, unknown>> {
+    const id = parseModelIdentity(this.spec.model);
+    const model = id ? v2Model(id.provider, id.model) : undefined;
+    const body = this.apiVersion === 2 ? {
+      title: 'cezar task', location: { directory: this.spec.cwd },
+      permissions: [{ action: '*', resource: '*', effect: 'allow' }],
+      ...(model ? { model } : {}),
+    } : { title: 'cezar task' };
+    let created: Record<string, unknown>;
+    try {
+      created = await this.http('POST', this.apiVersion === 2 ? '/api/session' : '/session', body);
+    } catch (err) {
+      // Probing said 1.x yet the session route is refused: not a server we can drive.
+      if (this.apiVersion === 1 && err instanceof OpencodeStatusError && (err.status === 404 || err.status === 405)) {
+        throw new Error(unsupportedServerMessage(err.status));
+      }
+      throw err;
+    }
+    return created;
+  }
+
+  private async openSession(opened: Record<string, unknown>): Promise<void> {
+    this.sessionId = stringField(opened, 'id');
+    if (!this.sessionId) throw new Error('opencode did not return a session id');
+    if (this.apiVersion === 2) this.v2Events = new OpencodeV2Events(this.sessionId);
+    this.emit({ type: 'session', sessionId: this.sessionId });
+    const sessionId = this.sessionId;
+    this.emitUi((state) => opencodeSessionStarted(sessionId, state));
+
+    // The SSE subscription must be LIVE before the first prompt posts —
+    // events the server emits while the POST is in flight would otherwise be
+    // lost (a race this await closes; the bundled mock made it visible).
+    await this.consumeEvents();
+    if (this.apiVersion === 2 && !this.sseConnected) throw new Error('OpenCode V2 event stream could not be established');
+  }
+
+  /**
+   * Post one prompt and resolve when the TURN ends — not when the HTTP
+   * response does.
+   *
+   * Opencode holds `POST /session/:id/message` open for the whole turn, so the
+   * response is neither a reliable nor a timely boundary: it lands before the
+   * final text part (the bundled mock exists to pin that ordering), and when
+   * the transport drops it mid-turn the turn has not ended at all. Reading it
+   * as the boundary is what parked live runs under "Needs you" at exactly 5:00
+   * (#897). The end comes from the wire `session.idle`, the same signal v2 has
+   * always used, with `armTurnGrace()` as the bounded way out when no such
+   * signal is coming.
+   */
+  private async prompt(text: string): Promise<void> {
+    if (!this.sessionId || !this.serverOpen) return;
+    // A prompt posted while a turn is still in flight supersedes it — the
+    // cockpit lets a user type into a running task (#986), so this is reachable.
+    // Settle the old waiter here or its `await turnEnded` never resolves, and
+    // with it the `sendMessage`/`bootstrap` call that is waiting on it. The
+    // agent is still working, so this is NOT a turn end: emitting one made the
+    // workflow auto-nudge, which superseded again, until the budget was gone (#2097).
+    const superseding = this.turnInFlight;
+    if (superseding) this.supersedeTurn();
+    const generation = ++this.turnGeneration;
+    if (this.autoEndTimer) {
+      clearTimeout(this.autoEndTimer);
+      this.autoEndTimer = undefined;
+    }
+    this.turnInFlight = true;
+    this.turnPostSettled = false;
+    this.turnDropped = undefined;
+    const turnEnded = new Promise<void>((resolve) => {
+      this.endTurn = resolve;
+    });
+    // v2 turn boundary — the prompt POST is the turn start (§7.1); a superseding prompt joins the open turn.
+    if (!superseding) this.emitUi(opencodeTurnStarted);
+    const body: Record<string, unknown> = { parts: [{ type: 'text', text }] };
+    // `spec.model` arrives already normalised to canonical `provider/model`
+    // (the run wiring's fail-loud gate). Split it with the shared parser — the
+    // one every runner uses — into opencode's `{ providerID, modelID }`.
+    const id = parseModelIdentity(this.spec.model);
+    if (id) body.model = { providerID: id.provider, modelID: id.model };
+    let failure: unknown;
+    try {
+      if (this.apiVersion === 2) {
+        await this.http('POST', `/api/session/${this.sessionId}/prompt`, { text });
+        // V2 admits input immediately. Only the agent loop's wait/idle, NOT
+        // the prompt acknowledgement or a quiet five seconds, ends the turn.
+        await this.http('POST', `/api/experimental/session/${this.sessionId}/wait`, undefined);
+      } else {
+        const res = await this.http('POST', `/session/${this.sessionId}/message`, body);
+        this.absorbUsage(res);
+      }
+    } catch (err) {
+      // A transport drop on a session the event bus still shows alive is no
+      // evidence about the agent — swallow it and keep listening. Anything
+      // else (an HTTP status, a dead server) is a real failure and is raised
+      // to the caller exactly as before.
+      if (this.isDropWhileSessionLives(err)) {
+        this.turnDropped = err instanceof Error ? err.message : String(err);
+      } else {
+        failure = err;
+      }
+    }
+    if (generation !== this.turnGeneration || !this.serverOpen) return;
+    if (this.apiVersion === 2 && this.turnDropped !== undefined && failure === undefined) {
+      // A dropped wait is not a successful wait. Keep listening for native
+      // idle; stream loss, server exit and the session deadline still bound
+      // this path. Never start the completion grace on a transport failure.
+      await turnEnded;
+      return;
+    }
+    this.turnPostSettled = true;
+    if (failure !== undefined) {
+      this.finishTurn();
+      throw failure;
+    }
+    this.armTurnGrace();
+    await turnEnded;
+  }
+
+  /** Release the in-flight turn's waiter without ending the turn (#2097). */
+  private supersedeTurn(): void {
+    if (this.turnGraceTimer) {
+      clearTimeout(this.turnGraceTimer);
+      this.turnGraceTimer = undefined;
+    }
+    const resolve = this.endTurn;
+    this.endTurn = undefined;
+    resolve?.();
+  }
+
+  /**
+   * End the in-flight turn, once. The single place `turn-end` is emitted, so
+   * every exit — `session.idle`, the grace window, teardown, a server that
+   * exited — produces exactly one.
+   *
+   * `fromIdle` marks the one exit that is the session's own word for "the turn
+   * is over". Every other exit is cezar synthesizing a boundary, and if the
+   * POST also dropped during this turn that drop was never explained: report it
+   * then, so a server that really did die does not go quiet just because #897
+   * stopped a live one from being parked.
+   */
+  private finishTurn(fromIdle = false): void {
+    if (!this.turnInFlight) return;
+    if (this.apiVersion === 2 && !fromIdle) {
+      // The wait fallback, disconnect and teardown must close BOTH protocol
+      // streams, not leave the cockpit with a permanently running turn.
+      this.emitUi((state) => mapOpencodeEvent({ type: 'session.idle', properties: { sessionID: this.sessionId } }, state));
+    }
+    this.turnInFlight = false;
+    if (this.turnGraceTimer) {
+      clearTimeout(this.turnGraceTimer);
+      this.turnGraceTimer = undefined;
+    }
+    const dropped = this.turnDropped;
+    this.turnDropped = undefined;
+    // A part that never saw `time.end` (abort, server quirk) still surfaces
+    // its prose before the turn boundary (run.ts reads markers there).
+    this.textCoalescer.flush();
+    if (dropped !== undefined && !fromIdle) {
+      this.emit({ type: 'note', message: `opencode: prompt failed: ${dropped}` });
+    }
+    this.emit({ type: 'turn-end' });
+    if (this.opts.autoEndAfterFirstTurn && this.serverOpen && !this.autoEndTimer) {
+      this.autoEndTimer = setTimeout(() => this.end(), AUTO_END_DELAY_MS);
+      this.autoEndTimer.unref?.();
+    }
+    const resolve = this.endTurn;
+    this.endTurn = undefined;
+    resolve?.();
+  }
+
+  /**
+   * Arm (or re-arm) the wait for a `session.idle` that may never come. Only
+   * meaningful once the POST has settled — before that the turn is plainly
+   * still running. With no event bus to listen to there is nothing to wait
+   * for, so the HTTP response stays the boundary, exactly as it was.
+   */
+  private armTurnGrace(): void {
+    if (!this.turnInFlight || !this.turnPostSettled) return;
+    if (this.turnGraceTimer) {
+      clearTimeout(this.turnGraceTimer);
+      this.turnGraceTimer = undefined;
+    }
+    if (!this.sseConnected || this.sseClosed) {
+      this.finishTurn();
+      return;
+    }
+    this.turnGraceTimer = setTimeout(() => this.finishTurn(), TURN_IDLE_GRACE_MS);
+    this.turnGraceTimer.unref?.();
+  }
+
+  /** Did the prompt POST drop on a session the event bus still shows alive? */
+  private isDropWhileSessionLives(err: unknown): boolean {
+    // An HTTP status is an answer from the server, not a lost connection.
+    if (!(err instanceof OpencodeTransportError)) return false;
+    if (!this.serverOpen || this.hasExited()) return false;
+    return this.sseConnected && !this.sseClosed;
+  }
+
+  // ---- SSE stream ---------------------------------------------------------
+
+  /** Resolves once the SSE stream is CONNECTED (headers in) — the frames are
+   *  then drained in the background. Callers await the connection so no
+   *  event emitted after this resolves can be missed. */
+  private async consumeEvents(): Promise<void> {
+    if (!this.baseUrl) return;
+    this.sseConnected = await openOpencodeEventStream(`${this.baseUrl}${this.apiVersion === 2 ? '/api/event' : '/event'}`, {
+      headers: this.headers,
+      signal: this.sse.signal,
+      onFrame: (frame) => this.handleFrame(frame),
+      // The bus is the turn's evidence of life; once it is gone a turn waiting
+      // on `session.idle` would wait forever.
+      onClose: () => {
+        this.sseClosed = true;
+        if (this.apiVersion === 2 && this.serverOpen && !this.sse.signal.aborted) {
+          this.emit({ type: 'error', message: 'opencode: V2 event stream disconnected' });
+          this.end();
+          return;
+        }
+        this.armTurnGrace();
+      },
+    });
+  }
+
+  private handleFrame(frame: string): void {
+    const dataLines = frame
+      .split('\n')
+      .filter((l) => l.startsWith('data:'))
+      .map((l) => l.slice(5).trim());
+    if (dataLines.length === 0) return;
+    let evt: unknown;
+    try {
+      evt = JSON.parse(dataLines.join('\n'));
+    } catch {
+      return;
+    }
+    // The bus's own keep-alives prove the server is up, not that the agent is working.
+    const kind = (evt as { type?: unknown } | null)?.type;
+    if (kind !== 'server.heartbeat' && kind !== 'server.connected') this.deadline.touch();
+    const events = this.v2Events ? this.v2Events.normalize(evt) : [evt as OpencodeEvent];
+    for (const event of events) {
+      this.emitUi((state) => mapOpencodeEvent(event, state));
+      this.handleEvent(event);
+    }
+  }
+
+  private handleEvent(evt: OpencodeEvent): void {
+    const type = evt.type ?? '';
+    const props = evt.properties ?? {};
+    if (type === 'message.updated' || type === 'message.created' || type === 'message.completed') {
+      const info = (props.info as Record<string, unknown>) ?? props;
+      const mid = stringField(info, 'id');
+      const role = stringField(info, 'role');
+      if (mid && role) this.msgRole.set(mid, role);
+      this.absorbUsage(info);
+      this.armTurnGrace();
+    } else if (type === 'message.part.updated' || type === 'message.part.created') {
+      this.handlePart((props.part as Record<string, unknown>) ?? props);
+      this.armTurnGrace();
+    } else if (type === 'permission.asked' || type === 'permission.updated') {
+      void this.answerPermission(props);
+    } else if (type === 'question.asked') {
+      this.handleQuestion(props);
+    } else if (type === 'session.idle') {
+      // The turn boundary (#897). A subtask session going idle closes only its
+      // own scope, exactly as the v2 mapper reads it.
+      const sid = stringField(props, 'sessionID');
+      if (sid === undefined || sid === this.sessionId) this.finishTurn(true);
+    } else if (type === 'session.error' && this.apiVersion === 2) {
+      const error = props.error as Record<string, unknown> | undefined;
+      this.emit({ type: 'error', message: `opencode: ${error && stringField(error, 'message') || 'session error'}` });
+    } else if (type === 'session.status') {
+      const sid = stringField(props, 'sessionID');
+      if (sid === undefined || sid === this.sessionId) this.giveUpOnLongRetry(props.status);
+    }
+  }
+
+  /** Fail the turn on a retry that needs a human (`action`) or waits past `RETRY_GIVE_UP_MS`.
+   *  A quota `action` is worded as a usage limit and books the auto-resume; any other action never
+   *  does (resuming meets the same refusal). A long backoff without one auto-resumes only when
+   *  OpenCode's own text names a limit, else it waits for a manual Continue. */
+  private giveUpOnLongRetry(status: unknown): void {
+    if (!isRecord(status) || status.type !== 'retry' || !this.serverOpen) return;
+    const next = typeof status.next === 'number' && Number.isFinite(status.next) ? status.next : undefined;
+    const action = isRecord(status.action) ? status.action : undefined;
+    if (!action && (next === undefined || next - Date.now() < RETRY_GIVE_UP_MS)) return;
+    const quota = QUOTA_REASON_RE.test(action ? stringField(action, 'reason') ?? '' : '');
+    const reason = stringField(status, 'message') ?? 'the provider refused the request';
+    const at = next === undefined ? '' : ` — ${action && !quota ? 'next attempt' : 'retry at'} ${new Date(next).toISOString()}`;
+    this.retryGaveUp = true;
+    this.emit({ type: 'error', message: `opencode: ${quota ? 'usage limit reached: ' : ''}${reason}${at}` });
+    this.interrupt();
+  }
+
+  /** An unanswered prompt parks `opencode serve` forever — c3d30076 sat 21 h on
+   *  `external_directory` for its own handoff file. Every prompt gets a reply:
+   *  the runner's, or the user's on the card (#2042). */
+  private async answerPermission(props: Record<string, unknown>): Promise<void> {
+    const id = stringField(props, 'id');
+    if (!id || this.permissionsAnswered.has(id)) return;
+    this.permissionsAnswered.add(id);
+    const reply = opencodePermissionReply(props, this.spec.env, this.spec.cwd);
+    // Ask the user rather than refuse behind their back (#2042) — but only when one can answer:
+    // an autonomous or headless run keeps the refusal, never a park only a human could end.
+    if (reply === 'reject' && this.opts.onUiEvent && this.opts.canAskPermission?.() === true) {
+      this.pendingPermissions.push({ id, props });
+      if (this.pendingPermissions.length === 1) this.askNextPermission();
+      return;
+    }
+    if (reply === 'reject') {
+      this.emit({ type: 'note', message: `opencode: refused ${permissionSubject(props)}` });
+    }
+    await this.replyPermission(id, props, { reply });
+  }
+
+  private askNextPermission(): void {
+    const head = this.pendingPermissions[0];
+    if (!head || !this.serverOpen) return;
+    this.opts.onUiEvent?.({
+      type: 'ask.requested',
+      requestId: `opencode-permission-${head.id}`,
+      questions: [{
+        header: 'Permission',
+        question: `OpenCode asks for ${permissionSubject(head.props)}. Allow it?`,
+        options: PERMISSION_OPTIONS.map(({ label, description }) => ({ label, description })),
+        multiSelect: false,
+      }],
+    });
+  }
+
+  private async replyPermission(
+    id: string,
+    props: Record<string, unknown>,
+    answer: { reply: OpencodePermissionReply; message?: string },
+  ): Promise<void> {
+    const { reply } = answer;
+    try {
+      await this.http('POST', `/permission/${encodeURIComponent(id)}/reply`, answer);
+    } catch {
+      // Servers before the permission rework only know the session-scoped route.
+      const sid = stringField(props, 'sessionID') ?? this.sessionId;
+      if (!sid) return;
+      await this.http('POST', `/session/${encodeURIComponent(sid)}/permissions/${encodeURIComponent(id)}`, {
+        response: reply,
+      }).catch(() => undefined);
+    }
+  }
+
+  /** OpenCode's native `question` tool blocks the session until it is answered; show it as an
+   *  ask card and hold the next message back as the answer (#1652). */
+  private handleQuestion(props: Record<string, unknown>): void {
+    const id = stringField(props, 'id');
+    if (!id) return;
+    const sid = stringField(props, 'sessionID');
+    if (sid !== undefined && sid !== this.sessionId) return;
+    const raw = Array.isArray(props.questions) ? props.questions : [];
+    const questions = parseAskRequest({
+      questions: raw.map((q, i) => {
+        const r = isRecord(q) ? q : {};
+        const text = stringField(r, 'question') ?? '';
+        return {
+          id: String(i),
+          header: (stringField(r, 'header') ?? text).slice(0, 12),
+          question: text,
+          options: (Array.isArray(r.options) ? r.options : []).filter(isRecord).map((o) => ({
+            label: stringField(o, 'label') ?? '',
+            ...(stringField(o, 'description') ? { description: stringField(o, 'description') } : {}),
+          })),
+          multiSelect: r.multiple === true,
+        };
+      }),
+    })?.questions;
+    if (!questions) {
+      // A card needs 2+ options; refuse rather than leave the session blocked.
+      this.emit({ type: 'note', message: 'opencode: declined a question the cockpit cannot render' });
+      void this.http('POST', `/question/${encodeURIComponent(id)}/reject`, undefined).catch(() => undefined);
+      return;
+    }
+    this.pendingQuestion = { id, questions };
+    this.opts.onUiEvent?.({ type: 'ask.requested', requestId: `opencode-${id}`, questions });
+  }
+
+  private async replyQuestion(pending: { id: string; questions: AskQuestion[] }, text: string): Promise<void> {
+    const byId = userInputAnswers(pending.questions, text);
+    const answers = pending.questions.map((q, i) => byId[q.id ?? String(i)]?.answers ?? []);
+    try {
+      await this.http('POST', `/question/${encodeURIComponent(pending.id)}/reply`, { answers });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.emit({ type: 'note', message: `opencode: question reply failed: ${message}` });
+    }
+  }
+
+  private handlePart(part: Record<string, unknown>): void {
+    // Only surface parts of assistant messages — the user's own message streams
+    // over the same feed. Role is known early (the message.updated event
+    // precedes its parts); an unknown role means "not assistant yet" → skip.
+    const messageID = stringField(part, 'messageID');
+    if (messageID && this.msgRole.get(messageID) !== 'assistant') return;
+    const kind = stringField(part, 'type');
+    const id = stringField(part, 'id') ?? messageID ?? '';
+    if (kind === 'text') {
+      const full = stringField(part, 'text') ?? '';
+      const seen = this.textSeen.get(id) ?? 0;
+      if (full.length > seen) {
+        this.textSeen.set(id, full.length);
+        this.textCoalescer.append(id, full.slice(seen));
+      }
+      // `time.end` marks the part finished (same signal the v2 mapper uses) —
+      // emit the whole block once, preferring the snapshot's full text.
+      const time = part.time as Record<string, unknown> | undefined;
+      if (time && typeof time === 'object' && typeof time.end === 'number') {
+        this.textCoalescer.complete(id, full);
+      }
+    } else if (kind === 'tool') {
+      const state = (part.state as Record<string, unknown> | undefined) ?? {};
+      const status = stringField(state, 'status');
+      // V2's input-start contains no arguments yet; keep the UI's pending
+      // item, but only record a v1 tool-call once parsed input is available.
+      if (this.apiVersion === 2 && status === 'pending') return;
+      const name = stringField(part, 'tool') ?? stringField(part, 'name') ?? 'tool';
+      const callId = id || `${name}-${this.toolsSeen.size}`;
+      if (!this.toolsSeen.has(callId)) {
+        this.toolsSeen.add(callId);
+        this.toolCalls.push({ id: callId, name, input: state.input ?? state });
+        this.emit({ type: 'tool-call', id: callId, tool: name, input: state.input ?? state });
+      }
+      if (status === 'completed' || status === 'error') {
+        this.emit({
+          type: 'tool-result',
+          toolCallId: callId,
+          result: safeStringify(state.output ?? state.result ?? state),
+          isError: status === 'error',
+        });
+      }
+      // The chat shows images from the v1 event; completed snapshots repeat, the image must not (#1896).
+      if (status === 'completed' && !this.imagesEmitted.has(callId)) {
+        const images = opencodeImageAttachments(state);
+        if (images.length > 0) this.imagesEmitted.add(callId);
+        for (const img of images) this.emit({ type: 'image', ...img });
+      }
+    }
+  }
+
+  /** Pull cumulative tokens/cost out of an assistant message info object. */
+  private absorbUsage(info: Record<string, unknown> | undefined): void {
+    if (!info) return;
+    if (this.apiVersion === 2) {
+      const id = stringField(info, 'id');
+      const tokens = info.tokens as Record<string, unknown> | undefined;
+      if (!id || (!tokens && typeof info.cost !== 'number')) return;
+      const cache = tokens?.cache as Record<string, unknown> | undefined;
+      const count = tokens ? numField(tokens, 'input') + numField(tokens, 'output') + numField(tokens, 'reasoning')
+        + (cache ? numField(cache, 'read') + numField(cache, 'write') : 0) : 0;
+      const previous = this.v2UsageByMessage.get(id);
+      const cost = typeof info.cost === 'number' && Number.isFinite(info.cost) ? info.cost : 0;
+      this.v2UsageByMessage.set(id, { tokens: Math.max(previous?.tokens ?? 0, count), cost: Math.max(previous?.cost ?? 0, cost) });
+      let total = 0;
+      let usd = 0;
+      for (const usage of this.v2UsageByMessage.values()) { total += usage.tokens; usd += usage.cost; }
+      if (total > this.tokensUsed) {
+        this.tokensUsed = total;
+        this.emit({ type: 'token-usage', tokensUsed: total });
+      }
+      if (usd > (this.lastCost ?? 0)) {
+        this.emit({ type: 'cost', usd: usd - (this.lastCost ?? 0) });
+        this.lastCost = usd;
+      }
+      return;
+    }
+    // Cumulative per message: sum distinct messages, never take a session maximum (#2101).
+    const id = stringField(info, 'id') ?? '';
+    const tokens = info.tokens as Record<string, unknown> | undefined;
+    const count = tokens ? numField(tokens, 'input') + numField(tokens, 'output') + numField(tokens, 'reasoning') : 0;
+    const cost = info.cost;
+    // A turn the provider turned away for a usage limit spent nothing, whatever list-price estimate
+    // OpenCode stamped on it (#1756); costs of earlier messages and of other failures stay (#1346).
+    const usd = typeof cost === 'number' && Number.isFinite(cost) && cost >= 0 && !isUsageLimitRejection(info.error) ? cost : 0;
+    const reported = typeof cost === 'number' && Number.isFinite(cost) && cost >= 0;
+    const previous = this.v1UsageByMessage.get(id);
+    this.v1UsageByMessage.set(id, { tokens: Math.max(previous?.tokens ?? 0, count), cost: Math.max(previous?.cost ?? 0, usd) });
+    let totalTokens = 0;
+    let totalCost = 0;
+    // An id-less snapshot (the POST body) only stands in while no identified message exists.
+    const anonymous = this.v1UsageByMessage.size > 1 ? '' : undefined;
+    for (const [key, usage] of this.v1UsageByMessage) {
+      if (key === anonymous) continue;
+      totalTokens += usage.tokens;
+      totalCost += usage.cost;
+    }
+    if (totalTokens > this.tokensUsed) {
+      this.tokensUsed = totalTokens;
+      this.emit({ type: 'token-usage', tokensUsed: totalTokens });
+    }
+    if ((reported && this.lastCost === undefined) || totalCost > (this.lastCost ?? 0)) {
+      this.emit({ type: 'cost', usd: totalCost - (this.lastCost ?? 0) });
+      this.lastCost = totalCost;
+    }
+  }
+
+  // ---- http ---------------------------------------------------------------
+
+  /**
+   * One call to the server. Goes through `opencode-http.ts` rather than the
+   * global `fetch` so no undici `headersTimeout`/`bodyTimeout` default cuts the
+   * prompt long-poll at 300 s (#897) — see that module's header for why.
+   *
+   * Rejects with `OpencodeTransportError` when the connection failed and a
+   * plain `Error` when the server answered with a status; only the caller can
+   * tell whether the first of those means anything.
+   */
+  private async http(
+    method: string,
+    path: string,
+    body: unknown,
+  ): Promise<Record<string, unknown>> {
+    if (!this.baseUrl) throw new Error('opencode server not ready');
+    const res = await opencodeRequest(`${this.baseUrl}${path}`, { method, body, headers: this.headers, signal: this.sse.signal });
+    if (res.status < 200 || res.status >= 300) {
+      const envelope = parseRecord(res.body);
+      const data = isRecord(envelope.data) ? envelope.data : {};
+      const name = stringField(envelope, 'name');
+      const message = stringField(data, 'message');
+      const detail = name && message ? `${name}: ${message}`.slice(0, 300) : res.body.slice(0, 200);
+      throw new OpencodeStatusError(res.status, `${method} ${path} → ${res.status} ${detail}`);
+    }
+    if (!res.body) return {};
+    try {
+      const parsed = JSON.parse(res.body) as Record<string, unknown>;
+      return this.apiVersion === 2 && parsed.data && typeof parsed.data === 'object'
+        ? parsed.data as Record<string, unknown> : parsed;
+    } catch {
+      if (this.apiVersion === 2) throw new Error(`OpenCode V2 returned invalid JSON for ${method} ${path}`);
+      return {};
+    }
+  }
+
+  private emit(event: AgentEvent): void {
+    this.onEvent?.(event);
+  }
+
+  /** The mapper never throws, but a defect in it must still never disturb
+   *  the v1 stream — hence the belt-and-braces try. */
+  private emitUi(map: (state: OpencodeUiMapperState) => OpencodeUiMapping): void {
+    try {
+      const mapped = map(this.uiState);
+      this.uiState = mapped.state;
+      if (this.opts.onUiEvent) {
+        for (const event of mapped.events) this.opts.onUiEvent(event);
+      }
+    } catch {
+      // v2 mapping is best-effort; v1 consumers stay unaffected.
+    }
+  }
+}
+
+// ---- helpers --------------------------------------------------------------
+
+interface OpencodeEvent {
+  type?: string;
+  properties?: Record<string, unknown>;
+}
+
+/** V2 separates a variant from the provider-native model id. */
+function v2Model(providerID: string, model: string): Record<string, string> {
+  const [id, variant] = model.split('#', 2);
+  return { providerID, id: id!, ...(variant ? { variant } : {}) };
+}
+
+function textOf(content: ContentBlock[]): string {
+  return content
+    .filter((b): b is Extract<ContentBlock, { type: 'text' }> => b.type === 'text')
+    .map((b) => b.text)
+    .join('\n')
+    .trim();
+}
+
+/**
+ * The reply to one OpenCode permission prompt. Only this run's own state
+ * outside the worktree is granted: its handoff file (`CEZ_HANDOFF_FILE`), the
+ * files in its pasted-attachments folder (`runs/<CEZ_TASK_ID>-images/`), and
+ * its scratch directory when cezar set `TMPDIR` to it (#785), the directories
+ * cezar names in its env for the agent — the dispatch tree (`CEZ_TREE_DIR`) and
+ * `CEZ_ARTIFACTS_DIR`, the ones `agentDirectories` hands claude (#2115) — and
+ * the targets of the skill links cezar itself provisioned into `cwd` (#2103) —
+ * never a committed or agent-made link, which could point anywhere. A config rule
+ * cannot do this — OpenCode matches rules against the whole parent directory
+ * (`runs/*`), which would expose every other task's transcript. Paths are
+ * compared after following symlinks. Everything else is refused, `once` so no
+ * grant outlives the call.
+ */
+export function opencodePermissionReply(
+  props: Record<string, unknown>,
+  env: Record<string, string> | undefined,
+  cwd?: string,
+): 'once' | 'reject' {
+  const permission = stringField(props, 'permission') ?? stringField(props, 'type');
+  const filepath = isRecord(props.metadata) ? stringField(props.metadata, 'filepath') : undefined;
+  const handoffFile = env?.CEZ_HANDOFF_FILE;
+  const taskId = env?.CEZ_TASK_ID;
+  if (permission !== 'external_directory' || !filepath || !handoffFile || !taskId) return 'reject';
+  const target = canonicalPath(filepath);
+  for (const dir of [env.CEZ_TREE_DIR, env.CEZ_ARTIFACTS_DIR]) {
+    if (!dir) continue;
+    const root = canonicalPath(dir);
+    if (target === root || target.startsWith(root + sep)) return 'once';
+  }
+  if (cwd && provisionedLinkTargets(cwd).some((root) => target === root || target.startsWith(root + sep))) return 'once';
+  const handoff = canonicalPath(handoffFile);
+  if (target === handoff) return 'once';
+  const runsDir = dirname(handoff);
+  if (dirname(target) === join(runsDir, `${taskId}-images`)) return 'once';
+  // Resolved through the same helper that placed it — #999 moved it out of `<dataDir>/tmp`.
+  const tmp = canonicalPath(agentTmpDir(dirname(runsDir), taskId));
+  if (env.TMPDIR && canonicalPath(env.TMPDIR) === tmp && (target === tmp || target.startsWith(tmp + sep))) {
+    return 'once';
+  }
+  return 'reject';
+}
+
+type OpencodePermissionReply = 'once' | 'always' | 'reject';
+
+const PERMISSION_OPTIONS: Array<{ label: string; description: string; reply: OpencodePermissionReply }> = [
+  { label: 'Allow once', description: 'Grant this one request.', reply: 'once' },
+  { label: 'Always allow', description: 'Grant it, and matching requests, for the rest of this session.', reply: 'always' },
+  { label: 'Reject', description: 'Refuse it; the agent is told it was denied.', reply: 'reject' },
+];
+
+/** What a permission prompt asks for, in one line: `external_directory permission for /x`. */
+function permissionSubject(props: Record<string, unknown>): string {
+  const what = stringField(props, 'permission') ?? stringField(props, 'type') ?? 'unknown';
+  const metadata = isRecord(props.metadata) ? props.metadata : {};
+  const patterns = Array.isArray(props.patterns) ? props.patterns.filter((p): p is string => typeof p === 'string') : [];
+  const target = stringField(metadata, 'filepath') ?? stringField(metadata, 'command') ?? stringField(props, 'pattern') ?? patterns[0];
+  return `${what} permission${target ? ` for ${target}` : ''}`;
+}
+
+/** The user's answer to a permission card. Anything but an Allow option is a refusal, and free
+ *  text rides along as the refusal's message so the agent hears what the user said instead. */
+export function permissionAnswer(text: string): { reply: OpencodePermissionReply; message?: string } {
+  const raw = text.trim().replace(/^Permission:\s*/, '');
+  const option = PERMISSION_OPTIONS.find((o) => o.label.toLowerCase() === raw.toLowerCase());
+  if (option) return { reply: option.reply };
+  return { reply: 'reject', message: raw };
+}
+
+/** Random high port, clear of opencode's own 4096 (#1179); the bound URL is read back from
+ *  the server's output or a `/path` probe. */
+/** An assistant message's `error` that says the quota, not the model, ended the turn. */
+export function isUsageLimitRejection(error: unknown): boolean {
+  if (!isRecord(error)) return false;
+  const data = isRecord(error.data) ? error.data : {};
+  const status = typeof data.statusCode === 'number' ? data.statusCode : undefined;
+  if (status === 429 || status === 402) return true;
+  return QUOTA_REASON_RE.test(`${stringField(error, 'name') ?? ''} ${stringField(data, 'message') ?? ''}`);
+}
+
+function randomServerPort(): number {
+  return 40000 + Math.floor(Math.random() * 20000);
+}
+
+/** Is `port` held on loopback right now — the bind the server itself attempts? */
+function portTaken(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const probe = createServer();
+    probe.once('error', (err: NodeJS.ErrnoException) => resolve(err.code === 'EADDRINUSE'));
+    probe.listen(port, '127.0.0.1', () => probe.close(() => resolve(false)));
+  });
+}
+
+/** `realpath` of the deepest existing ancestor, rest re-appended — the file a
+ *  prompt names may not exist yet (a write), but its directories decide where it lands. */
+function canonicalPath(path: string): string {
+  const abs = resolve(path);
+  const rest: string[] = [];
+  let dir = abs;
+  for (;;) {
+    try {
+      return join(realpathSync.native(dir), ...rest.reverse());
+    } catch {
+      const parent = dirname(dir);
+      if (parent === dir) return abs;
+      rest.push(basename(dir));
+      dir = parent;
+    }
+  }
+}
+
+/** The URL line opencode prints once listening — matched on stdout or stderr. */
+const SERVER_URL_RE = /https?:\/\/(?:[\d.]+|localhost):\d+/;
+
+function parseRecord(text: string): Record<string, unknown> {
+  try {
+    const value: unknown = JSON.parse(text);
+    return isRecord(value) ? value : {};
+  } catch {
+    return {};
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function stringField(obj: Record<string, unknown>, key: string): string | undefined {
+  const v = obj[key];
+  return typeof v === 'string' ? v : undefined;
+}
+
+function numField(obj: Record<string, unknown>, key: string): number {
+  const v = obj[key];
+  return typeof v === 'number' ? v : 0;
+}
+
+function safeStringify(value: unknown): string {
+  if (typeof value === 'string') return value;
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function wrapSpawnError(err: unknown, bin: string): Error {
+  const code = (err as NodeJS.ErrnoException | undefined)?.code;
+  if (code === 'ENOENT') {
+    return new Error(
+      `\`${bin}\` not found on PATH — install OpenCode (https://opencode.ai) and run \`opencode\` once to configure a provider`,
+    );
+  }
+  return err instanceof Error ? err : new Error(String(err));
+}

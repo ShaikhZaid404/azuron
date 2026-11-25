@@ -1,0 +1,193 @@
+import { RotateCcwIcon, XIcon } from 'lucide-react'
+import * as React from 'react'
+
+import { Kbd } from '@/components/kbd'
+import { Button } from '@/components/ui/button'
+import { toast } from '@/components/ui/toaster'
+import {
+  altGrProblem,
+  BINDABLE_COMMANDS,
+  chordFromEvent,
+  chordProblem,
+  DEFAULT_KEYBINDINGS,
+  formatChord,
+  isApplePlatform,
+} from '@/lib/keybindings'
+import { clientSurface } from '@/lib/telemetry'
+import { useKeybindings } from '@/lib/use-keybindings'
+import { cn } from '@/lib/utils'
+import { SettingsCard } from './form-row'
+
+/**
+ * Settings → Keyboard (spec 2026-10-17-task-palette): every task-palette command a shortcut can
+ * run, its CURRENT binding as a key cap (or "Unassigned"), and Record / Remove / Reset. The same
+ * overrides ⇧↵ in ⌘P writes. GLOBAL, like Appearance — `~/.cezar/ui-state.json`.
+ */
+export function KeyboardSection() {
+  const keybindings = useKeybindings()
+  const [recording, setRecording] = React.useState<string | null>(null)
+  const [problem, setProblem] = React.useState<string | null>(null)
+  const customized = Object.keys(keybindings.overrides).length > 0
+
+  const groups = React.useMemo(() => {
+    const byGroup = new Map<string, typeof BINDABLE_COMMANDS[number][]>()
+    for (const entry of BINDABLE_COMMANDS) byGroup.set(entry.group, [...(byGroup.get(entry.group) ?? []), entry])
+    // Bound from ⌘P to an id the catalog does not list (an Open in… target, a layout).
+    const extra = Object.keys(keybindings.overrides)
+      .filter((id) => !BINDABLE_COMMANDS.some((entry) => entry.id === id) && keybindings.overrides[id])
+      .map((id) => ({ id, label: id.replace(/^[a-z-]+:/, ''), group: 'Other' }))
+    if (extra.length > 0) byGroup.set('Other', extra)
+    return [...byGroup]
+  }, [keybindings.overrides])
+
+  // While recording, the next chord anywhere on the page is the answer — captured before every
+  // other shortcut listener so ⌘K or a bound chord cannot fire instead.
+  React.useEffect(() => {
+    if (!recording) return
+    const onKey = (event: KeyboardEvent) => {
+      // A bare Tab is leaving, not answering: focus moves on and recording ends.
+      if (event.key === 'Tab' && !event.metaKey && !event.ctrlKey && !event.altKey) return setRecording(null)
+      event.preventDefault()
+      event.stopImmediatePropagation()
+      if (event.key === 'Escape') return setRecording(null)
+      const bare = !event.metaKey && !event.ctrlKey && !event.altKey && !event.shiftKey
+      if (bare && (event.key === 'Backspace' || event.key === 'Delete')) {
+        keybindings.assign(recording, null)
+        return setRecording(null)
+      }
+      const chord = chordFromEvent(event)
+      if (!chord) {
+        const altGr = altGrProblem(event)
+        if (altGr) setProblem(altGr)
+        return
+      }
+      const refused = chordProblem(chord)
+      if (refused) return setProblem(`${formatChord(chord)} — ${refused}`)
+      const previous = [...keybindings.bindings].find(([id, held]) => held === chord && id !== recording)?.[0]
+      keybindings.assign(recording, chord)
+      if (previous) toast(`${formatChord(chord)} moved from ${labelOf(previous)} to ${labelOf(recording)}`)
+      setRecording(null)
+    }
+    // A press anywhere but this row's chord button (whose click toggles) gives the keyboard back.
+    const onPointerDown = (event: PointerEvent) => {
+      const chordButton = event.target instanceof Element ? event.target.closest('[data-slot="shortcut-chord"]') : null
+      if (chordButton?.closest<HTMLElement>('[data-command-id]')?.dataset.commandId === recording) return
+      setRecording(null)
+    }
+    window.addEventListener('keydown', onKey, { capture: true })
+    window.addEventListener('pointerdown', onPointerDown, { capture: true })
+    return () => {
+      window.removeEventListener('keydown', onKey, { capture: true })
+      window.removeEventListener('pointerdown', onPointerDown, { capture: true })
+    }
+  }, [recording, keybindings])
+  const apple = isApplePlatform()
+
+  return (
+    <div data-slot="keyboard-section" className="flex w-full flex-col gap-5">
+      <p className="text-ui text-muted-foreground">
+        Run a task’s commands from the keyboard while the task is open. {formatChord('Mod+P')} lists them all;
+        press {apple ? '⇧↵' : 'Shift+Enter'} on a row there to set its shortcut. {apple ? '⌘' : 'Ctrl'} chords also
+        work while you type. {apple ? '⌥↑ / ⌥↓' : 'Alt+↑ / Alt+↓'} go to the previous / next task,{' '}
+        {apple ? '⌥⇧↑ / ⌥⇧↓' : 'Alt+Shift+↑ / Alt+Shift+↓'} to the previous / next one that needs you
+        {clientSurface() === 'desktop'
+          ? ` — and ${apple ? '⌃⌥↑ / ⌃⌥↓' : 'Ctrl+Alt+↑ / Ctrl+Alt+↓'} do that from any application.`
+          : '.'}
+        {' '}Click a binding to record a new one.
+      </p>
+
+      {groups.map(([group, entries], index) => (
+        <SettingsCard
+          key={group}
+          id={`shortcuts-${group.toLowerCase().replace(/\s+/g, '-')}`}
+          title={group}
+          action={
+            index === 0 ? (
+              <Button
+                variant="ghost"
+                size="sm"
+                data-action="reset-all-shortcuts"
+                disabled={!customized || !keybindings.ready}
+                onClick={keybindings.resetAll}
+              >
+                <RotateCcwIcon aria-hidden="true" /> Reset all
+              </Button>
+            ) : undefined
+          }
+        >
+          {entries.map((entry) => {
+            const chord = keybindings.bindings.get(entry.id)
+            const isRecording = recording === entry.id
+            const changed = entry.id in keybindings.overrides
+            return (
+              <div
+                key={entry.id}
+                data-slot="shortcut-row"
+                data-command-id={entry.id}
+                data-bound={chord ? '' : undefined}
+                className="flex items-center gap-2 px-4 py-2 text-ui"
+              >
+                <span className="min-w-0 flex-1 truncate">{entry.label}</span>
+                {isRecording ? (
+                  <span data-slot="shortcut-recording" className="text-label text-violet">
+                    {problem ?? 'Press keys… (esc cancels, ⌫ removes)'}
+                  </span>
+                ) : null}
+                <button
+                  type="button"
+                  data-slot="shortcut-chord"
+                  aria-label={chord ? `Change the shortcut for ${entry.label} (${formatChord(chord)})` : `Set a shortcut for ${entry.label}`}
+                  disabled={!keybindings.ready}
+                  onClick={() => {
+                    setProblem(null)
+                    setRecording(isRecording ? null : entry.id)
+                  }}
+                  onBlur={() => {
+                    if (isRecording) setRecording(null)
+                  }}
+                  className={cn(
+                    'flex h-7 min-w-24 items-center justify-end gap-1 rounded-md px-1.5 text-label transition-colors hover:bg-muted',
+                    isRecording ? 'text-primary ring-1 ring-primary' : 'text-muted-foreground hover:text-foreground',
+                  )}
+                >
+                  {chord ? (
+                    <Kbd data-slot="shortcut-binding">{formatChord(chord)}</Kbd>
+                  ) : (
+                    <span data-slot="shortcut-binding" data-unassigned="" className="text-soft-foreground">Unassigned</span>
+                  )}
+                </button>
+                {changed ? (
+                  <Button
+                    variant="ghost"
+                    size="icon-sm"
+                    aria-label={`Reset ${entry.label} to ${DEFAULT_KEYBINDINGS[entry.id] ? formatChord(DEFAULT_KEYBINDINGS[entry.id]!) : 'no shortcut'}`}
+                    title="Reset to default"
+                    onClick={() => keybindings.reset(entry.id)}
+                  >
+                    <RotateCcwIcon aria-hidden="true" />
+                  </Button>
+                ) : chord ? (
+                  <Button
+                    variant="ghost"
+                    size="icon-sm"
+                    aria-label={`Remove the shortcut for ${entry.label}`}
+                    title="Remove"
+                    onClick={() => keybindings.assign(entry.id, null)}
+                  >
+                    <XIcon aria-hidden="true" />
+                  </Button>
+                ) : (
+                  <span className="size-7 shrink-0" />
+                )}
+              </div>
+            )
+          })}
+        </SettingsCard>
+      ))}
+    </div>
+  )
+}
+
+function labelOf(id: string): string {
+  return BINDABLE_COMMANDS.find((entry) => entry.id === id)?.label ?? id
+}

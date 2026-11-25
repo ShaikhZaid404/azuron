@@ -3,14 +3,22 @@
     "target": "ES2022",
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
-    "declaration": true,
-    "declarationMap": true,
-    "outDir": "dist",
-    "rootDir": "src",
+    // No `lib.dom`, no `types` — this package is consumed by a Node service AND bundled into a
+    // browser, so it may reach for neither runtime. A `node:*` import fails to compile here,
+    // which is what keeps the invariant structural rather than a comment.
+    "lib": ["ES2022"],
+    "types": [],
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true,
     "strict": true,
-    "esModuleInterop": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "forceConsistentCasingInFileNames": true,
     "skipLibCheck": true,
-    "forceConsistentCasingInFileNames": true
+    "declaration": true,
+    "sourceMap": true,
+    "outDir": "dist",
+    "rootDir": "src"
   },
-  "include": ["src/**/*"]
+  "include": ["src/**/*.ts"]
 }

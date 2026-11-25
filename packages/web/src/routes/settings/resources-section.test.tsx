@@ -1,0 +1,424 @@
+import { QueryClientProvider } from '@tanstack/react-query'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { MemoryRouter } from 'react-router'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+
+import { queryKeys, workspaceQueryKeys } from '@/api/queries'
+import { createQueryClient } from '@/api/query-client'
+import type { WorkspaceConfigResponse } from '@open-mercato/cezar-api-client'
+import { Toaster, resetToasts } from '@/components/ui/toaster'
+import { AppRoutes } from '@/routes'
+import { ThemeProvider } from '@/components/theme-provider'
+
+/**
+ * Global settings → Resources (step 3.5): `maxParallel` and `memoryLimitMb` moved out of the
+ * per-repo config into `~/.cezar/config.json` (spec §"Resource governance" — they protect the
+ * host, not a repo). What this pins is the store: every read and write goes to
+ * `/api/v1/workspace/config`, and the per-repo `/api/v1/config` is never touched from here — a
+ * regression there would silently re-introduce a value the engine no longer reads.
+ *
+ * The route contract itself (bounds, the semaphore refresh) is pinned server-side in
+ * src/server/workspace-api.test.ts.
+ */
+
+let requests: Array<{ method: string; url: string; body?: unknown }> = []
+
+function serve(resources: Partial<WorkspaceConfigResponse['resources']> = {}) {
+  requests = []
+  const state: WorkspaceConfigResponse = {
+    branding: { name: 'cezar', logoUrl: null },
+    computerName: 'Test Mac',
+    agentDefaults: {},
+    browseRoot: '~/',
+    projectsDir: '~/cezar/projects',
+    skillsAutoUpdate: null,
+    effectiveSkillsAutoUpdate: true,
+    orgSkillsRepos: [],
+    systemPrompt: null,
+    composerDefaults: {
+      autonomous: null,
+      worktree: null,
+      inheritedAutonomous: 'source-dependent',
+      inheritedWorktree: true,
+    },
+    resources: {
+      maxParallel: 2,
+      maxMonitoringSessions: 2,
+      idleTimeoutMinutes: 15,
+      monitoringWakeIntervalMinutes: null,
+      autoResumeOnUsageLimit: true,
+      memoryLimitMb: null,
+      worktreeRetentionDefault: 10, worktreeIdleDaysDefault: 7, archivedTaskDeleteDaysDefault: 90, diskGuard: { minFreePercent: 10, minFreeGb: 5, maxWorktreesGb: 20 },
+      ...resources,
+    },
+  }
+  const json = (payload: unknown, status = 200) =>
+    new Response(JSON.stringify(payload), { status, headers: { 'content-type': 'application/json' } })
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      const method = init?.method ?? 'GET'
+      const body = init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : undefined
+      requests.push({ method, url, body })
+      if (url === '/api/v1/workspace/config' && method === 'GET') return json(state)
+      if (url === '/api/v1/workspace/config' && method === 'PUT') {
+        const { diskGuard, ...rest } = (body?.resources ?? {}) as Partial<WorkspaceConfigResponse['resources']>
+        Object.assign(state.resources, rest)
+        if (diskGuard) state.resources.diskGuard = { ...state.resources.diskGuard, ...diskGuard }
+        return json(state)
+      }
+      return new Promise<never>(() => {})
+    }),
+  )
+}
+
+/** Seeds the step-3.2 route gates so the shell renders immediately. The global settings area is
+ *  unscoped, but the gates still answer for the chrome rendered around it. */
+function gateSeededClient() {
+  const client = createQueryClient()
+  client.setQueryData(queryKeys.health, { bootProject: 'boot' })
+  client.setQueryData(workspaceQueryKeys.projects, {
+    projects: [],
+    bootProject: 'boot',
+    projectsDir: '~/cezar/projects',
+  })
+  return client
+}
+
+function renderResources(entry = '/settings/global/resources') {
+  render(
+    <QueryClientProvider client={gateSeededClient()}>
+      <ThemeProvider>
+        <MemoryRouter initialEntries={[entry]}>
+          <AppRoutes />
+          <Toaster />
+        </MemoryRouter>
+      </ThemeProvider>
+    </QueryClientProvider>,
+  )
+}
+
+const parallelSelect = () =>
+  document.querySelector<HTMLInputElement>('[data-slot="resources-max-parallel"]')
+const memoryInput = () =>
+  document.querySelector<HTMLInputElement>('[data-slot="resources-memory-limit"]')
+const puts = () => requests.filter((r) => r.method === 'PUT' && r.url === '/api/v1/workspace/config')
+const monitoringSelect = () => document.querySelector<HTMLInputElement>('[data-slot="resources-max-monitoring"]')
+const idleTimeout = () => document.querySelector<HTMLInputElement>('[data-slot="resources-idle-timeout"]')
+const wakeMode = () => document.querySelector<HTMLButtonElement>('[data-slot="resources-monitoring-wake-mode"]')
+const wakeInterval = () => document.querySelector<HTMLInputElement>('[data-slot="resources-monitoring-wake-interval"]')
+
+/** Radix Select in jsdom: open from the keyboard, pick with a pointer-up (the item's touch path). */
+async function pick(trigger: HTMLElement, option: string | RegExp) {
+  fireEvent.keyDown(trigger, { key: 'ArrowDown' })
+  fireEvent.click(await screen.findByRole('option', { name: option }))
+}
+
+beforeEach(() => {
+  Element.prototype.scrollIntoView = vi.fn()
+  vi.stubGlobal('ResizeObserver', class { observe() {} unobserve() {} disconnect() {} })
+})
+
+afterEach(() => {
+  act(() => resetToasts())
+  cleanup()
+  vi.unstubAllGlobals()
+})
+
+describe('Settings → Behaviour (the old Resources page)', () => {
+  it('renders the workspace values, read from /api/v1/workspace/config', async () => {
+    serve({ maxParallel: 5, memoryLimitMb: 4096 })
+    renderResources()
+
+    await waitFor(() => expect(parallelSelect()).not.toBeNull())
+    expect(parallelSelect()!.value).toBe('5')
+    expect(memoryInput()!.value).toBe('4096')
+    // The per-repo config is not even read by this pane.
+    expect(requests.some((r) => r.url === '/api/v1/config')).toBe(false)
+  })
+
+  it('saves maxParallel to the WORKSPACE config, never the per-repo one', async () => {
+    serve({ maxParallel: 2 })
+    renderResources()
+    await waitFor(() => expect(parallelSelect()).not.toBeNull())
+
+    fireEvent.change(parallelSelect()!, { target: { value: '6' } })
+    fireEvent.keyDown(parallelSelect()!, { key: 'Enter' })
+
+    await waitFor(() => expect(puts()).toHaveLength(1))
+    expect(puts()[0]?.body).toEqual({ resources: { maxParallel: 6 } })
+    expect(requests.some((r) => r.method === 'PUT' && r.url === '/api/v1/config')).toBe(false)
+  })
+
+  it('links workspace limits to the per-project controls', async () => {
+    serve()
+    renderResources()
+
+    const link = await screen.findByRole('link', { name: 'Configure per-project limits' })
+    expect(link.getAttribute('href')).toBe('/settings/global/projects')
+    expect(screen.getByText(/Need a different limit for one project/)).not.toBeNull()
+  })
+
+  it('saves the extra monitoring capacity and explains the two pools', async () => {
+    serve({ maxParallel: 4, maxMonitoringSessions: 2 })
+    renderResources()
+    await waitFor(() => expect(monitoringSelect()).not.toBeNull())
+    expect(screen.getByText(/Capacity: 4 active \+ 2 monitoring/)).not.toBeNull()
+    fireEvent.change(monitoringSelect()!, { target: { value: '3' } })
+    fireEvent.blur(monitoringSelect()!)
+    await waitFor(() => expect(puts()).toHaveLength(1))
+    expect(puts()[0]?.body).toEqual({ resources: { maxMonitoringSessions: 3 } })
+  })
+
+  it('saves the waiting-session idle timeout and allows disabling it', async () => {
+    serve({ idleTimeoutMinutes: 15 })
+    renderResources()
+    await waitFor(() => expect(idleTimeout()).not.toBeNull())
+    expect(idleTimeout()!.value).toBe('15')
+    fireEvent.change(idleTimeout()!, { target: { value: '0' } })
+    fireEvent.blur(idleTimeout()!)
+    await waitFor(() => expect(puts()).toHaveLength(1))
+    expect(puts()[0]?.body).toEqual({ resources: { idleTimeoutMinutes: 0 } })
+  })
+
+  it('is a typed integer field with arrows, not a dropdown — stepping saves once', async () => {
+    serve({ maxParallel: 2, maxMonitoringSessions: 2 })
+    renderResources()
+    await waitFor(() => expect(parallelSelect()).not.toBeNull())
+    expect(parallelSelect()!.tagName).toBe('INPUT')
+    expect(monitoringSelect()!.tagName).toBe('INPUT')
+
+    const increase = screen.getByRole('button', { name: 'Increase Max parallel tasks' })
+    fireEvent.click(increase)
+    fireEvent.click(increase)
+    expect(parallelSelect()!.value).toBe('4')
+    await waitFor(() => expect(puts()).toHaveLength(1))
+    expect(puts()[0]?.body).toEqual({ resources: { maxParallel: 4 } })
+  })
+
+  it('refuses a limit outside the range the server accepts', async () => {
+    serve({ maxParallel: 2 })
+    renderResources()
+    await waitFor(() => expect(parallelSelect()).not.toBeNull())
+    fireEvent.change(parallelSelect()!, { target: { value: '40' } })
+    fireEvent.blur(parallelSelect()!)
+    expect(screen.getByText('Enter a whole number from 1 to 16.')).not.toBeNull()
+    expect(puts()).toHaveLength(0)
+  })
+
+  it('keeps wake-ups parked by default and saves an explicit interval on change', async () => {
+    serve({ monitoringWakeIntervalMinutes: null })
+    renderResources()
+    await waitFor(() => expect(wakeMode()).not.toBeNull())
+    expect(wakeMode()!.getAttribute('data-value')).toBe('park')
+    expect(wakeInterval()).toBeNull()
+    // Switching the mode saves at once with the default cadence…
+    await pick(wakeMode()!, 'Re-check on an interval')
+    await waitFor(() => expect(puts()).toHaveLength(1))
+    expect(puts()[0]?.body).toEqual({ resources: { monitoringWakeIntervalMinutes: 5 } })
+    // …and the cadence field then saves on blur or Enter, with "Saved" inline.
+    await waitFor(() => expect(wakeInterval()?.value).toBe('5'))
+    fireEvent.change(wakeInterval()!, { target: { value: '10' } })
+    fireEvent.keyDown(wakeInterval()!, { key: 'Enter' })
+    await waitFor(() => expect(puts()).toHaveLength(2))
+    expect(puts()[1]?.body).toEqual({ resources: { monitoringWakeIntervalMinutes: 10 } })
+    await waitFor(() => expect(wakeInterval()!.closest('[data-slot="form-row"]')?.querySelector('[data-slot="saved-indicator"]')?.textContent).toBe('Saved'))
+    // An invalid cadence is refused inline and never sent.
+    fireEvent.change(wakeInterval()!, { target: { value: '90' } })
+    fireEvent.blur(wakeInterval()!)
+    expect(document.querySelector('[data-slot="stepper-invalid"]')).not.toBeNull()
+    expect(wakeInterval()!.getAttribute('aria-invalid')).toBe('true')
+    expect(puts()).toHaveLength(2)
+  })
+
+  it('shows auto-resume on by default and saves the opt-out', async () => {
+    serve()
+    renderResources()
+    const toggle = await screen.findByRole('switch', { name: 'Auto-resume after a usage limit' })
+    // The shipped default (spec 2026-08-03-auto-resume-after-usage-limit) — a user who never
+    // opens this pane still gets their limited tasks finished.
+    expect(toggle.getAttribute('aria-checked')).toBe('true')
+
+    fireEvent.click(toggle)
+    await waitFor(() => expect(puts()).toHaveLength(1))
+    expect(puts()[0]?.body).toEqual({ resources: { autoResumeOnUsageLimit: false } })
+  })
+
+  it.each(['/settings/global/behaviour#auto-resume', '/settings/global/resources#auto-resume'])(
+    '%s lands on the auto-resume switch in the Monitoring card, once the config has loaded',
+    async (entry) => {
+      const scrolled: string[] = []
+      Element.prototype.scrollIntoView = vi.fn(function (this: Element) {
+        scrolled.push(this.id)
+      })
+      serve()
+      renderResources(entry)
+      await waitFor(() => expect(scrolled).toContain('auto-resume'))
+      const row = document.getElementById('auto-resume')!
+      expect(row.querySelector('[data-slot="resources-auto-resume"]')).not.toBeNull()
+      expect(row.closest('section')?.id).toBe('monitoring')
+    },
+  )
+
+  it('saves a memory limit, and an empty field clears it back to "no limit"', async () => {
+    serve({ memoryLimitMb: null })
+    renderResources()
+    await waitFor(() => expect(memoryInput()).not.toBeNull())
+
+    fireEvent.change(memoryInput()!, { target: { value: '2048' } })
+    fireEvent.blur(memoryInput()!)
+    await waitFor(() => expect(puts()).toHaveLength(1))
+    expect(puts()[0]?.body).toEqual({ resources: { memoryLimitMb: 2048 } })
+    // Blurring again with the same value is not a second save.
+    fireEvent.blur(memoryInput()!)
+    expect(puts()).toHaveLength(1)
+
+    fireEvent.change(memoryInput()!, { target: { value: '' } })
+    fireEvent.keyDown(memoryInput()!, { key: 'Enter' })
+    await waitFor(() => expect(puts()).toHaveLength(2))
+    expect(puts()[1]?.body).toEqual({ resources: { memoryLimitMb: null } })
+  })
+
+  it('rejects a memory limit below the floor — said inline, and nothing is PUT', async () => {
+    serve()
+    renderResources()
+    await waitFor(() => expect(memoryInput()).not.toBeNull())
+
+    for (const bad of ['12', '1024.5', '-1']) {
+      fireEvent.change(memoryInput()!, { target: { value: bad } })
+      fireEvent.blur(memoryInput()!)
+      expect(document.querySelector('[data-slot="stepper-invalid"]')).not.toBeNull()
+      expect(memoryInput()!.getAttribute('aria-invalid')).toBe('true')
+    }
+    expect(puts()).toHaveLength(0)
+  })
+
+  it('every numeric field is an IntegerStepper — no native number input, no native select (redesign 2026-11)', async () => {
+    serve({ memoryLimitMb: 4096, monitoringWakeIntervalMinutes: 5 })
+    renderResources()
+    await waitFor(() => expect(wakeInterval()).not.toBeNull())
+    const section = document.querySelector('[data-slot="resources-section"]')!
+    expect(section.querySelector('input[type="number"]')).toBeNull()
+    expect(section.querySelector('select')).toBeNull()
+    for (const field of [memoryInput(), wakeInterval()]) {
+      expect(field!.getAttribute('role')).toBe('spinbutton')
+      expect(field!.closest('[data-slot="form-row"]')).not.toBeNull()
+    }
+    // Stepping from "no limit" lands on a sane first limit, not the floor.
+    serve({ memoryLimitMb: null })
+    cleanup()
+    renderResources()
+    await waitFor(() => expect(memoryInput()).not.toBeNull())
+    expect(memoryInput()!.placeholder).toBe('No limit')
+    fireEvent.click(document.querySelector('[data-slot="resources-memory-limit"]')!.parentElement!.querySelector('[data-action="stepper-increment"]')!)
+    expect(memoryInput()!.value).toBe('2048')
+    // …and the arrows move it in 256 MiB steps, as main's number input did.
+    fireEvent.click(document.querySelector('[data-slot="resources-memory-limit"]')!.parentElement!.querySelector('[data-action="stepper-increment"]')!)
+    expect(memoryInput()!.value).toBe('2304')
+    fireEvent.keyDown(memoryInput()!, { key: 'ArrowDown' })
+    fireEvent.keyDown(memoryInput()!, { key: 'ArrowDown' })
+    expect(memoryInput()!.value).toBe('1792')
+  })
+
+  it('worktree retention is NOT here — it stayed with the project', async () => {
+    serve()
+    renderResources()
+    await waitFor(() => expect(parallelSelect()).not.toBeNull())
+    expect(document.querySelector('[data-slot="resources-worktree-retention"]')).toBeNull()
+    expect(screen.queryByText('Keep last N worktrees')).toBeNull()
+  })
+
+  it('renders and saves New task On/Off/Inherit policy', async () => {
+    serve()
+    renderResources()
+    const autonomous = await screen.findByLabelText('Autonomous by default')
+    const worktree = screen.getByLabelText('Use a worktree by default')
+    expect(autonomous.getAttribute('data-value')).toBe('inherit')
+    expect(screen.getByText(/source-dependent — skills on, workflows off/)).toBeTruthy()
+
+    await pick(autonomous, 'Off')
+    await waitFor(() => expect(puts().at(-1)?.body).toEqual({
+      composerDefaults: { autonomous: false },
+    }))
+    await pick(worktree, 'On')
+    await waitFor(() => expect(puts().at(-1)?.body).toEqual({
+      composerDefaults: { worktree: true },
+    }))
+  })
+})
+
+describe('Settings → Resources → Worktrees (spec 2026-11-19-worktree-disk-usage)', () => {
+  const field = (slot: string) => document.querySelector<HTMLInputElement>(`[data-slot="${slot}"]`)
+  const commit = (input: HTMLInputElement, value: string) => {
+    fireEvent.change(input, { target: { value } })
+    fireEvent.blur(input)
+  }
+
+  it('renders the age default and the disk guard thresholds from the workspace config', async () => {
+    serve({ worktreeIdleDaysDefault: 14, diskGuard: { minFreePercent: 15, minFreeGb: 8, maxWorktreesGb: 40 } })
+    renderResources()
+    await waitFor(() => expect(field('resources-worktree-idle-days')).not.toBeNull())
+    expect(field('resources-worktree-idle-days')!.value).toBe('14')
+    expect(field('resources-disk-guard-min-free-percent')!.value).toBe('15')
+    expect(field('resources-disk-guard-min-free-gb')!.value).toBe('8')
+    expect(field('resources-disk-guard-max-worktrees-gb')!.value).toBe('40')
+    expect(screen.getByText(/Currently 14 days/)).not.toBeNull()
+  })
+
+  it('saves the age default, 0 included (off), to the workspace config', async () => {
+    serve()
+    renderResources()
+    await waitFor(() => expect(field('resources-worktree-idle-days')).not.toBeNull())
+    commit(field('resources-worktree-idle-days')!, '0')
+    await waitFor(() => expect(puts()).toHaveLength(1))
+    expect(puts()[0]?.body).toEqual({ resources: { worktreeIdleDaysDefault: 0 } })
+    await waitFor(() => expect(screen.getByText(/0 = off\. Off\./)).not.toBeNull())
+  })
+
+  it('renders and saves the archived-task lifetime default, 0 included (never)', async () => {
+    serve({ archivedTaskDeleteDaysDefault: 30 })
+    renderResources()
+    await waitFor(() => expect(field('resources-archived-delete-days')).not.toBeNull())
+    expect(field('resources-archived-delete-days')!.value).toBe('30')
+    expect(screen.getByText(/Currently 30 days/)).not.toBeNull()
+    commit(field('resources-archived-delete-days')!, '0')
+    await waitFor(() => expect(puts()).toHaveLength(1))
+    expect(puts()[0]?.body).toEqual({ resources: { archivedTaskDeleteDaysDefault: 0 } })
+    await waitFor(() => expect(screen.getByText(/0 = never\. Never\./)).not.toBeNull())
+  })
+
+  it('refuses an archived-task lifetime past the server bound (3650)', async () => {
+    serve()
+    renderResources()
+    await waitFor(() => expect(field('resources-archived-delete-days')).not.toBeNull())
+    commit(field('resources-archived-delete-days')!, '3651')
+    expect(document.querySelector('[data-slot="stepper-invalid"]')).not.toBeNull()
+    expect(puts()).toHaveLength(0)
+  })
+
+  it('saves each guard threshold alone, so the others keep their value', async () => {
+    serve()
+    renderResources()
+    await waitFor(() => expect(field('resources-disk-guard-min-free-gb')).not.toBeNull())
+    commit(field('resources-disk-guard-min-free-gb')!, '0')
+    await waitFor(() => expect(puts()).toHaveLength(1))
+    expect(puts()[0]?.body).toEqual({ resources: { diskGuard: { minFreeGb: 0 } } })
+    commit(field('resources-disk-guard-max-worktrees-gb')!, '50')
+    await waitFor(() => expect(puts()).toHaveLength(2))
+    expect(puts()[1]?.body).toEqual({ resources: { diskGuard: { maxWorktreesGb: 50 } } })
+    expect(field('resources-disk-guard-min-free-percent')!.value).toBe('10')
+    await waitFor(() =>
+      expect(field('resources-disk-guard-max-worktrees-gb')!.closest('[data-slot="form-row"]')!.getAttribute('data-saved')).toBe(''),
+    )
+  })
+
+  it('refuses a free-space percentage past the server bound (50)', async () => {
+    serve()
+    renderResources()
+    await waitFor(() => expect(field('resources-disk-guard-min-free-percent')).not.toBeNull())
+    commit(field('resources-disk-guard-min-free-percent')!, '51')
+    expect(document.querySelector('[data-slot="stepper-invalid"]')).not.toBeNull()
+    expect(puts()).toHaveLength(0)
+  })
+})

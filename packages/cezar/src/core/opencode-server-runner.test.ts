@@ -1,0 +1,1169 @@
+import type { ChildProcessWithoutNullStreams } from 'node:child_process';
+import { EventEmitter } from 'node:events';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { createServer } from 'node:net';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { PassThrough } from 'node:stream';
+import { fileURLToPath } from 'node:url';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import type { AgentEvent } from './agent-runner.ts';
+import type { UiEvent } from './ui-events.ts';
+import { parseUsageLimit } from './usage-limit.ts';
+import { agentTmpDir } from '../runs/agent-tmpdir.ts';
+import { provisionSkills } from '../skills-provision.ts';
+import {
+  KILL_GRACE_MS,
+  OpencodeServerRunner,
+  SERVER_PORT_ATTEMPTS,
+  SERVER_START_MAX_MS,
+  TURN_IDLE_GRACE_MS,
+  opencodePermissionReply,
+  permissionAnswer,
+  isOpencodeMissingSessionError,
+  isUsageLimitRejection,
+  unsupportedServerMessage,
+} from './opencode-server-runner.ts';
+
+const spawnHook = vi.hoisted(() => ({
+  override: null as null | ((...args: unknown[]) => unknown),
+  actual: null as null | ((...args: unknown[]) => unknown),
+}));
+
+vi.mock('node:child_process', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:child_process')>();
+  spawnHook.actual = actual.spawn as (...args: unknown[]) => unknown;
+  return {
+    ...actual,
+    spawn: (...args: Parameters<typeof actual.spawn>) =>
+      spawnHook.override ? spawnHook.override(...args) : actual.spawn(...args),
+  };
+});
+
+const httpHook = vi.hoisted(() => ({ override: null as null | (() => Promise<never>) }));
+
+vi.mock('./opencode-http.ts', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./opencode-http.ts')>();
+  return {
+    ...actual,
+    opencodeRequest: (...args: Parameters<typeof actual.opencodeRequest>) =>
+      httpHook.override ? httpHook.override() : actual.opencodeRequest(...args),
+  };
+});
+
+/**
+ * #858 — the OpenCode half of #844. `opencode serve` installs its own SIGTERM handler, so the
+ * teardown watchdog must decide "is it dead?" from a real exit, never from `ChildProcess.killed`,
+ * which Node flips the moment a signal is *delivered*. Gating on the flag made the SIGKILL
+ * unreachable for exactly the server it exists for: one leaked process per teardown, and — because
+ * every teardown path here is followed by `await this.exited` — a session result that never settles.
+ */
+describe('SIGTERM→SIGKILL escalation for an opencode server that survives SIGTERM', () => {
+  function signallableChild(): {
+    child: ChildProcessWithoutNullStreams;
+    signals: NodeJS.Signals[];
+    exit: (code: number) => void;
+  } {
+    const signals: NodeJS.Signals[] = [];
+    const emitter = new EventEmitter();
+    const child = Object.assign(emitter, {
+      stdin: new PassThrough(),
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+      exitCode: null as number | null,
+      signalCode: null as NodeJS.Signals | null,
+      killed: false,
+      pid: 5150,
+      // Node's semantics: delivery flips `killed` whether or not the child dies.
+      kill: (signal: NodeJS.Signals) => {
+        signals.push(signal);
+        Object.assign(child, { killed: true });
+        return true;
+      },
+    }) as unknown as ChildProcessWithoutNullStreams;
+    const exit = (code: number) => {
+      Object.assign(child, { exitCode: code });
+      emitter.emit('exit', code, null);
+    };
+    return { child, signals, exit };
+  }
+
+  function withFakeChild(run: (fake: ReturnType<typeof signallableChild>) => void): void {
+    const fake = signallableChild();
+    spawnHook.override = () => fake.child;
+    vi.useFakeTimers();
+    try {
+      run(fake);
+    } finally {
+      vi.useRealTimers();
+      spawnHook.override = null;
+    }
+  }
+
+  /** No wall-clock deadline; the test drives the teardown itself. */
+  function startSession(timeoutMs: number) {
+    const session = new OpencodeServerRunner({ bin: 'opencode', timeoutMs }).startSession({
+      userPrompt: 'do it',
+      cwd: process.cwd(),
+    });
+    // The server never comes up behind a fake child, so the result rejects/settles on its own path.
+    void session.result.catch(() => undefined);
+    return session;
+  }
+
+  it.each([false, true])('refuses messages after autonomous exit (stdout held open: %s)', (heldOpen) => {
+    withFakeChild((fake) => {
+      const session = startSession(0);
+      expect(session.open).toBe(true);
+      fake.exit(1);
+      if (!heldOpen) (fake.child.stdout as PassThrough).end();
+
+      expect.soft(session.open).toBe(false);
+      expect.soft(session.sendMessage([{ type: 'text', text: 'x' }])).toBe(false);
+      if (heldOpen) expect(fake.child.stdout.readableEnded).toBe(false);
+      expect(fake.signals).toEqual([]);
+      (fake.child.stdout as PassThrough).end();
+    });
+  });
+
+  it('refuses messages after autonomous exit while the HTTP channel stays open', async () => {
+    let received!: () => void;
+    const requestReceived = new Promise<void>((resolve) => { received = resolve; });
+    let closeChannel!: (error: Error) => void;
+    const channel = new Promise<never>((_resolve, reject) => { closeChannel = reject; });
+    httpHook.override = () => {
+      received();
+      return channel;
+    };
+    const fake = signallableChild();
+    spawnHook.override = () => fake.child;
+    const session = startSession(0);
+    let settled = false;
+    const result = session.result.then(() => { settled = true; });
+    try {
+      (fake.child.stdout as PassThrough).write('http://127.0.0.1:5150\n');
+      await requestReceived;
+      expect(session.open).toBe(true);
+      fake.exit(1);
+
+      expect.soft(session.open).toBe(false);
+      expect.soft(session.sendMessage([{ type: 'text', text: 'x' }])).toBe(false);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(settled).toBe(false);
+      expect(fake.child.stdout.readableEnded).toBe(false);
+      expect(fake.signals).toEqual([]);
+    } finally {
+      closeChannel(new Error('HTTP channel closed'));
+      (fake.child.stdout as PassThrough).end();
+      await result;
+      spawnHook.override = null;
+      httpHook.override = null;
+    }
+    expect(settled).toBe(true);
+  });
+
+  it('escalates after end() even once Node flagged the server as killed', () => {
+    withFakeChild((fake) => {
+      const session = startSession(0);
+
+      session.end();
+      expect(fake.signals).toEqual(['SIGTERM']);
+      // Delivered, not dead — the state that used to disable the escalation.
+      expect(fake.child.killed).toBe(true);
+      expect(fake.child.exitCode).toBeNull();
+
+      vi.advanceTimersByTime(KILL_GRACE_MS);
+      expect(fake.signals).toEqual(['SIGTERM', 'SIGKILL']);
+    });
+  });
+
+  it('escalates on the wall-clock timeout path', () => {
+    withFakeChild((fake) => {
+      startSession(20);
+
+      vi.advanceTimersByTime(20);
+      expect(fake.signals).toEqual(['SIGTERM']);
+
+      vi.advanceTimersByTime(KILL_GRACE_MS);
+      expect(fake.signals).toEqual(['SIGTERM', 'SIGKILL']);
+    });
+  });
+
+  it('stops escalating once the server really exits after SIGTERM', () => {
+    withFakeChild((fake) => {
+      const session = startSession(0);
+
+      session.end();
+      expect(fake.signals).toEqual(['SIGTERM']);
+      fake.exit(143);
+
+      vi.advanceTimersByTime(KILL_GRACE_MS);
+      expect(fake.signals).toEqual(['SIGTERM']);
+    });
+  });
+
+  it('sends one SIGTERM per session however many teardown paths run', () => {
+    withFakeChild((fake) => {
+      const session = startSession(0);
+
+      // `interrupt()` on the deadline and the result promise's `finally` both
+      // reach terminate() for the same session; the escalation is armed once.
+      session.interrupt();
+      session.end();
+      session.interrupt();
+      expect(fake.signals).toEqual(['SIGTERM']);
+
+      vi.advanceTimersByTime(KILL_GRACE_MS);
+      expect(fake.signals).toEqual(['SIGTERM', 'SIGKILL']);
+    });
+  });
+
+  it('does not signal at all when the server exited before the teardown', () => {
+    withFakeChild((fake) => {
+      const session = startSession(0);
+      fake.exit(0);
+
+      session.end();
+      vi.advanceTimersByTime(KILL_GRACE_MS);
+      expect(fake.signals).toEqual([]);
+    });
+  });
+});
+
+describe('opencode serve startup', () => {
+  function silentChild(): ChildProcessWithoutNullStreams {
+    return Object.assign(new EventEmitter(), {
+      stdin: new PassThrough(),
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+      exitCode: null,
+      signalCode: null,
+      killed: false,
+      pid: 5151,
+      kill: () => true,
+    }) as unknown as ChildProcessWithoutNullStreams;
+  }
+
+  afterEach(() => {
+    vi.useRealTimers();
+    spawnHook.override = null;
+  });
+
+  it.each([0, 0.5, 0.99999])('passes a random port in 40000–59999 and exposes the PID synchronously (random=%s)', (random) => {
+    // An absent fixture binary keeps host-installed CLIs and desktop/Windows wrappers out of this argv check.
+    const dir = mkdtempSync(join(tmpdir(), 'cez-opencode-port-'));
+    const bin = join(dir, 'opencode');
+    let argv: unknown;
+    spawnHook.override = (_bin, args) => {
+      argv = args;
+      return silentChild();
+    };
+    vi.useFakeTimers();
+    const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(random);
+    try {
+      const session = new OpencodeServerRunner({ bin, timeoutMs: 0 }).startSession({ userPrompt: 'do it', cwd: process.cwd() });
+      void session.result.catch(() => undefined);
+      const port = 40000 + Math.floor(random * 20000);
+      expect(argv).toEqual(['serve', '--hostname', '127.0.0.1', '--port', String(port)]);
+      expect(Number.isInteger(port)).toBe(true);
+      expect(port).toBeGreaterThanOrEqual(40000);
+      expect(port).toBeLessThan(60000);
+      expect(session.pid).toBe(5151);
+    } finally {
+      randomSpy.mockRestore();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('fails the session when the server never reports a listening URL', async () => {
+    spawnHook.override = () => silentChild();
+    vi.useFakeTimers();
+    const events: AgentEvent[] = [];
+    const session = new OpencodeServerRunner({ bin: 'opencode', timeoutMs: 0 }).startSession(
+      { userPrompt: 'do it', cwd: process.cwd() },
+      (event) => events.push(event),
+    );
+    void session.result.catch(() => undefined);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(events).toContainEqual({ type: 'error', message: 'opencode: opencode serve did not report a listening URL within 30s' });
+  });
+
+  it('names the early exit status and keeps the bounded stderr tail in a local note', async () => {
+    const child = silentChild();
+    spawnHook.override = () => child;
+    const events: AgentEvent[] = [];
+    const session = new OpencodeServerRunner({ bin: 'opencode', timeoutMs: 0 }).startSession(
+      { userPrompt: 'do it', cwd: process.cwd() },
+      (event) => events.push(event),
+    );
+    void session.result.catch(() => undefined);
+    (child.stderr as PassThrough).write(`${'x'.repeat(1_000)}bad config`);
+    Object.assign(child, { exitCode: 1 });
+    (child as unknown as EventEmitter).emit('exit', 1, null);
+    (child as unknown as EventEmitter).emit('close', 1, null);
+    await session.result.catch(() => undefined);
+    expect(events.filter((e) => e.type === 'error')).toEqual([
+      { type: 'error', message: 'opencode: opencode serve exited before it started listening (exit code 1)' },
+    ]);
+    expect(events).toContainEqual({ type: 'note', message: `opencode serve stderr: ${'x'.repeat(790)}bad config` });
+  });
+
+  // 2d01c3c9: a start that keeps printing (a one-time migration) was failed at a flat 30s.
+  it('keeps waiting while the server is still printing, up to the hard cap', async () => {
+    const child = silentChild();
+    const stderr = child.stderr as PassThrough;
+    spawnHook.override = () => child;
+    vi.useFakeTimers();
+    const events: AgentEvent[] = [];
+    const session = new OpencodeServerRunner({ bin: 'opencode', timeoutMs: 0 }).startSession(
+      { userPrompt: 'do it', cwd: process.cwd() },
+      (event) => events.push(event),
+    );
+    void session.result.catch(() => undefined);
+    const errorsSoFar = () => events.filter((e) => e.type === 'error');
+    for (let t = 0; t < SERVER_START_MAX_MS - 20_000; t += 20_000) {
+      stderr.write(`migrating ${t}\n`);
+      await vi.advanceTimersByTimeAsync(20_000);
+    }
+    expect(errorsSoFar()).toEqual([]);
+    stderr.write('still migrating\n');
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(errorsSoFar()).toEqual([{ type: 'error', message: `opencode: opencode serve did not report a listening URL within ${SERVER_START_MAX_MS / 1000}s` }]);
+    expect(events).toContainEqual(expect.objectContaining({ type: 'note', message: expect.stringContaining('opencode serve stderr: migrating') }));
+  });
+
+  function exitingChild(stderr: string): ChildProcessWithoutNullStreams {
+    const child = silentChild();
+    setTimeout(() => {
+      (child.stderr as PassThrough).end(stderr);
+      Object.assign(child, { exitCode: 1 });
+      child.emit('exit', 1, null);
+      child.emit('close', 1, null);
+    }, 5);
+    return child;
+  }
+
+  it('does not respawn a server that exited for a reason other than its port', async () => {
+    let spawns = 0;
+    spawnHook.override = () => (spawns += 1, exitingChild('Error: bad config\n'));
+    const events: AgentEvent[] = [];
+    const session = new OpencodeServerRunner({ bin: 'opencode', timeoutMs: 0 }).startSession(
+      { userPrompt: 'do it', cwd: process.cwd() },
+      (event) => events.push(event),
+    );
+    await session.result;
+    expect(spawns).toBe(1);
+    expect(events.filter((e) => e.type === 'error')).toEqual([
+      { type: 'error', message: 'opencode: opencode serve exited before it started listening (exit code 1)' },
+    ]);
+    expect(events).toContainEqual({ type: 'note', message: 'opencode serve stderr: Error: bad config' });
+  });
+
+  it(`gives up after ${SERVER_PORT_ATTEMPTS} spawns that all lost their port`, async () => {
+    let spawns = 0;
+    spawnHook.override = () => (spawns += 1, exitingChild('Error: Unexpected error\n\nServeError\n'));
+    const events: AgentEvent[] = [];
+    const session = new OpencodeServerRunner({ bin: 'opencode', timeoutMs: 0 }).startSession(
+      { userPrompt: 'do it', cwd: process.cwd() },
+      (event) => events.push(event),
+    );
+    await session.result;
+    expect(spawns).toBe(SERVER_PORT_ATTEMPTS);
+    expect(events.filter((e) => e.type === 'error')).toEqual([
+      { type: 'error', message: 'opencode: opencode serve exited before it started listening (exit code 1)' },
+    ]);
+    expect(events.filter((e) => e.type === 'note')).toHaveLength(1);
+  });
+
+  // The message is a telemetry group key, so it never carries the elapsed time.
+  it('fails with one fixed message when the server prints and then goes silent', async () => {
+    const child = silentChild();
+    spawnHook.override = () => child;
+    vi.useFakeTimers();
+    const events: AgentEvent[] = [];
+    const session = new OpencodeServerRunner({ bin: 'opencode', timeoutMs: 0 }).startSession(
+      { userPrompt: 'do it', cwd: process.cwd() },
+      (event) => events.push(event),
+    );
+    void session.result.catch(() => undefined);
+    await vi.advanceTimersByTimeAsync(17_000);
+    (child.stderr as PassThrough).write('migrating\n');
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(events.filter((e) => e.type === 'error')).toEqual([
+      { type: 'error', message: 'opencode: opencode serve went silent for 30s without reporting a listening URL' },
+    ]);
+  });
+});
+
+describe('2d01c3c9 opencode serve that starts without the expected URL line', () => {
+  const mockBin = join(dirname(fileURLToPath(import.meta.url)), '__fixtures__', 'opencode', 'mock-opencode-serve.mjs');
+  const errors = (events: AgentEvent[]): AgentEvent[] => events.filter((e) => e.type === 'error');
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it.each(['silent', 'stderr'])('runs the turn when the URL line is %s', async (mode) => {
+    const events: AgentEvent[] = [];
+    const session = new OpencodeServerRunner({ bin: mockBin, timeoutMs: 60_000 }).startSession(
+      { userPrompt: 'check the tree', cwd: process.cwd(), env: { MOCK_START: mode } },
+      (e) => events.push(e),
+      { autoEndAfterFirstTurn: true },
+    );
+    const result = await session.result;
+    expect(errors(events)).toEqual([]);
+    expect(events.map((e) => e.type)).toContain('turn-end');
+    expect(result.sessionId).toBe('ses_mock_1');
+  }, 30_000);
+
+  it('surfaces the OpenCode error name and message for a failed prompt POST', async () => {
+    const events: AgentEvent[] = [];
+    const session = new OpencodeServerRunner({ bin: mockBin, timeoutMs: 60_000 }).startSession(
+      { userPrompt: '#http-error', cwd: process.cwd() },
+      (e) => events.push(e),
+    );
+    await session.result;
+    expect(errors(events)).toContainEqual({
+      type: 'error',
+      message: 'opencode: POST /session/ses_mock_1/message → 500 InternalError: Provider rejected the configured model',
+    });
+  }, 30_000);
+
+  it('never adopts a server on that port that serves another directory', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    const events: AgentEvent[] = [];
+    const session = new OpencodeServerRunner({ bin: mockBin, timeoutMs: 0 }).startSession(
+      { userPrompt: 'check the tree', cwd: process.cwd(), env: { MOCK_START: 'silent', MOCK_PATH_DIR: tmpdir() } },
+      (e) => events.push(e),
+    );
+    // Real time for the real probes (setInterval is not faked) to reach it.
+    await new Promise<void>((r) => setImmediate(r));
+    const until = performance.now() + 2_000;
+    while (performance.now() < until) await new Promise<void>((r) => setImmediate(r));
+    expect(events.find((e) => e.type === 'session')).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(30_000);
+    vi.useRealTimers();
+    await session.result.catch(() => undefined);
+    expect(errors(events)).toEqual([{ type: 'error', message: 'opencode: opencode serve did not report a listening URL within 30s' }]);
+  }, 30_000);
+});
+
+describe('#1756 cost on a turn a usage limit rejected', () => {
+  const mockBin = join(dirname(fileURLToPath(import.meta.url)), '__fixtures__', 'opencode', 'mock-opencode-serve.mjs');
+  const costs = async (marker: string): Promise<number[]> => {
+    const events: AgentEvent[] = [];
+    const session = new OpencodeServerRunner({ bin: mockBin, timeoutMs: 60_000 }).startSession(
+      { userPrompt: `work ${marker}`, cwd: process.cwd() },
+      (e) => events.push(e),
+      { autoEndAfterFirstTurn: true },
+    );
+    await session.result;
+    return events.flatMap((e) => (e.type === 'cost' ? [e.usd] : []));
+  };
+
+  it('keeps what was spent before the limit but not the rejected message', async () => {
+    expect(await costs('#limit-cost')).toEqual([0.02]);
+  }, 30_000);
+
+  it('still counts the cost of a message that failed for another reason (#1346)', async () => {
+    const usd = await costs('#fail-cost');
+    expect(usd.reduce((a, b) => a + b, 0)).toBeCloseTo(0.0405, 6); // two distinct messages add up (#2101)
+  }, 30_000);
+
+  it.each([
+    [{ name: 'APIError', data: { statusCode: 429 } }, true],
+    [{ name: 'FreeUsageLimitError', data: {} }, true],
+    [{ name: 'APIError', data: { message: 'Daily quota exceeded' } }, true],
+    [{ name: 'APIError', data: { statusCode: 500, message: 'stream closed' } }, false],
+    [undefined, false],
+  ])('classifies %j as a usage-limit rejection: %s', (error, expected) => {
+    expect(isUsageLimitRejection(error)).toBe(expected);
+  });
+});
+
+describe('dc1a91a6 a server with neither the 2.x probe nor the 1.x session route', () => {
+  const mockBin = join(dirname(fileURLToPath(import.meta.url)), '__fixtures__', 'opencode', 'mock-opencode-serve.mjs');
+
+  it('fails with an actionable message instead of a bare 405', async () => {
+    const events: AgentEvent[] = [];
+    const session = new OpencodeServerRunner({ bin: mockBin, timeoutMs: 60_000 }).startSession(
+      { userPrompt: 'check the tree', cwd: process.cwd(), env: { MOCK_API: 'v2' } },
+      (e) => events.push(e),
+      { autoEndAfterFirstTurn: true },
+    );
+    await session.result;
+    expect(events.filter((e) => e.type === 'error')).toEqual([
+      { type: 'error', message: `opencode: ${unsupportedServerMessage(405)}` },
+    ]);
+    expect(unsupportedServerMessage(405)).not.toMatch(/not supported yet/);
+  }, 30_000);
+});
+
+/**
+ * #897 — an OpenCode turn that runs longer than five minutes used to park the
+ * run under "Needs you".
+ *
+ * `opencode` holds `POST /session/:id/message` open for the whole agent turn.
+ * Node's global `fetch` is undici, whose default `headersTimeout`/`bodyTimeout`
+ * is 300_000 ms, so a turn still working at 5:00 lost its request with
+ * `TypeError: fetch failed` — and `prompt()`'s `finally` emitted `turn-end`
+ * anyway, which `workflows/run.ts` reads as "the agent stopped". The reporter
+ * measured four consecutive turns on one run each dropping at exactly 5:00,
+ * with SSE and tool events still flowing afterwards.
+ *
+ * The mock server's `#drop-post` script is that shape without the five-minute
+ * wait: the message POST's socket dies mid-turn, the session keeps streaming,
+ * and `session.idle` arrives later. It reproduces the CLIENT-visible symptom,
+ * which is the only thing the runner can react to.
+ */
+describe('#897 a turn that outlives its prompt POST', () => {
+  const mockBin = join(dirname(fileURLToPath(import.meta.url)), '__fixtures__', 'opencode', 'mock-opencode-serve.mjs');
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function record(): { events: AgentEvent[]; onEvent: (e: AgentEvent) => void } {
+    const events: AgentEvent[] = [];
+    return { events, onEvent: (e) => events.push(e) };
+  }
+
+  const types = (events: AgentEvent[]): string[] => events.map((e) => e.type);
+  const notes = (events: AgentEvent[]): string[] =>
+    events.filter((e): e is Extract<AgentEvent, { type: 'note' }> => e.type === 'note').map((e) => e.message);
+  const errors = (events: AgentEvent[]): string[] =>
+    events.filter((e): e is Extract<AgentEvent, { type: 'error' }> => e.type === 'error').map((e) => e.message);
+  const textIndex = (events: AgentEvent[], needle: string): number =>
+    events.findIndex((e) => e.type === 'text' && e.text.includes(needle));
+
+  /** Resolves once `count` `turn-end` events have been seen. */
+  function afterTurnEnds(events: AgentEvent[], count: number, timeoutMs = 10_000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    return new Promise((resolve, reject) => {
+      const tick = (): void => {
+        if (types(events).filter((t) => t === 'turn-end').length >= count) return resolve();
+        if (Date.now() > deadline) return reject(new Error(`only ${types(events).filter((t) => t === 'turn-end').length} turn-end(s) after ${timeoutMs}ms`));
+        setTimeout(tick, 10);
+      };
+      tick();
+    });
+  }
+
+  it('the first prompt (the Continue path): a dropped POST is neither a turn end nor a failure', async () => {
+    const runner = new OpencodeServerRunner({ bin: mockBin, timeoutMs: 60_000 });
+    const { events, onEvent } = record();
+    const session = runner.startSession(
+      { userPrompt: 'watch the CI run #drop-post', cwd: process.cwd() },
+      onEvent,
+      { autoEndAfterFirstTurn: true },
+    );
+    const result = await session.result;
+
+    // Used to be `opencode: prompt failed: fetch failed` on the later-turn path
+    // and a FATAL `{type:'error'}` here, which `runContinuation` answered with
+    // SIGTERM/SIGKILL on a session that was still working.
+    expect(notes(events)).toEqual([]);
+    expect(errors(events)).toEqual([]);
+
+    // The turn ends on `session.idle` — after the part the server streamed
+    // once the POST was already gone.
+    const late = textIndex(events, 'Still working after the drop.');
+    expect(late).toBeGreaterThan(-1);
+    expect(types(events).indexOf('turn-end')).toBeGreaterThan(late);
+    expect(types(events).filter((t) => t === 'turn-end')).toHaveLength(1);
+    expect(result.text).toContain('Still working after the drop.');
+  }, 30_000);
+
+  it('a later turn (the sendMessage path): the run is not parked while the session keeps working', async () => {
+    const runner = new OpencodeServerRunner({ bin: mockBin, timeoutMs: 60_000 });
+    const { events, onEvent } = record();
+    const session = runner.startSession({ userPrompt: 'check the tree', cwd: process.cwd() }, onEvent, {});
+    await afterTurnEnds(events, 1);
+    expect(notes(events)).toEqual([]);
+
+    const firstTurnEnds = types(events).filter((t) => t === 'turn-end').length;
+    expect(session.sendMessage([{ type: 'text', text: 'keep going #drop-post' }])).toBe(true);
+    await afterTurnEnds(events, firstTurnEnds + 1);
+
+    expect(notes(events)).toEqual([]);
+    expect(errors(events)).toEqual([]);
+    const late = textIndex(events, 'Still working after the drop.');
+    expect(late).toBeGreaterThan(-1);
+    // The second turn-end lands after the post-drop part, not at the drop.
+    expect(types(events).lastIndexOf('turn-end')).toBeGreaterThan(late);
+
+    session.end();
+    await session.result;
+  }, 30_000);
+
+  it('a turn that finishes normally is unchanged: one turn-end, after the last part, no note', async () => {
+    const runner = new OpencodeServerRunner({ bin: mockBin, timeoutMs: 60_000 });
+    const { events, onEvent } = record();
+    const session = runner.startSession({ userPrompt: 'check the tree', cwd: process.cwd() }, onEvent, {
+      autoEndAfterFirstTurn: true,
+    });
+    const result = await session.result;
+
+    expect(notes(events)).toEqual([]);
+    expect(errors(events)).toEqual([]);
+    expect(types(events).filter((t) => t === 'turn-end')).toHaveLength(1);
+    expect(types(events)).toContain('tool-call');
+    expect(types(events)).toContain('tool-result');
+    // The mock answers the POST BEFORE streaming "Done." — the boundary the
+    // runner used to take. Both parts are now inside the turn.
+    expect(types(events).indexOf('turn-end')).toBeGreaterThan(textIndex(events, 'Done.'));
+    expect(result.text).toContain('Checking the working tree.');
+    expect(result.text).toContain('Done.');
+  }, 30_000);
+
+  it('the prompt POST does not go through global fetch, so undici\'s 300s default cannot reach it', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+    const runner = new OpencodeServerRunner({ bin: mockBin, timeoutMs: 60_000 });
+    const { events, onEvent } = record();
+    const session = runner.startSession({ userPrompt: 'check the tree', cwd: process.cwd() }, onEvent, {
+      autoEndAfterFirstTurn: true,
+    });
+    await session.result;
+
+    expect(types(events)).toContain('turn-end');
+    expect(fetchSpy).not.toHaveBeenCalled();
+  }, 30_000);
+
+  // The random port is in the OS ephemeral range, so it can already be taken (release 0.16.1 CI).
+  // Contract: the first spawn hits the taken port, later ones avoid it, and the attempts stay
+  // within SERVER_PORT_ATTEMPTS. The exact count is not guaranteed: the respawn's own random
+  // pick can collide too (#2454).
+  async function respawnsAroundTakenPort(collideAgain: boolean): Promise<void> {
+    const blocker = createServer();
+    let taken = 0;
+    for (let p = 40000 + Math.floor(Math.random() * 19000); !taken; p += 1) {
+      taken = await new Promise<number>((resolve) => {
+        blocker.once('error', () => resolve(0));
+        blocker.listen(p, '127.0.0.1', () => resolve(p));
+      });
+    }
+    try {
+      const pick = (taken - 40000 + 0.5) / 20000;
+      const random = vi.spyOn(Math, 'random').mockReturnValueOnce(pick);
+      if (collideAgain) random.mockReturnValueOnce(pick);
+      const ports: string[] = [];
+      spawnHook.override = (file, args, options) => {
+        ports.push(String((args as string[]).at(-1)));
+        return spawnHook.actual!(file, args, options);
+      };
+      const runner = new OpencodeServerRunner({ bin: mockBin, timeoutMs: 60_000 });
+      const { events, onEvent } = record();
+      const session = runner.startSession({ userPrompt: 'check the tree', cwd: process.cwd() }, onEvent, {
+        autoEndAfterFirstTurn: true,
+      });
+      await session.result;
+
+      expect(ports[0]).toBe(String(taken));
+      if (collideAgain) expect(ports[1]).toBe(String(taken));
+      expect(ports.length).toBeGreaterThanOrEqual(2);
+      expect(ports.length).toBeLessThanOrEqual(SERVER_PORT_ATTEMPTS);
+      expect(ports.at(-1)).not.toBe(String(taken));
+      expect(notes(events)).toEqual([]);
+      expect(errors(events)).toEqual([]);
+      expect(types(events)).toContain('turn-end');
+    } finally {
+      spawnHook.override = null;
+      await new Promise((resolve) => blocker.close(resolve));
+    }
+  }
+
+  it('respawns on a fresh port when the random one is already taken', () => respawnsAroundTakenPort(false), 30_000);
+
+  it('still recovers when the respawn picks the taken port too', () => respawnsAroundTakenPort(true), 30_000);
+
+  /**
+   * The transitions OUT of the state this fix introduces. `session.idle` is now
+   * the boundary, so a server that never sends one — or has no event bus at all
+   * — must still reach `turn-end`, or a turn becomes a state with no exit.
+   */
+  it('a server that never sends session.idle still ends the turn, on the grace window', async () => {
+    const runner = new OpencodeServerRunner({ bin: mockBin, timeoutMs: 60_000 });
+    const { events, onEvent } = record();
+    const session = runner.startSession({ userPrompt: 'check the tree #no-idle', cwd: process.cwd() }, onEvent, {
+      autoEndAfterFirstTurn: true,
+    });
+    const started = Date.now();
+    await session.result;
+
+    expect(types(events).filter((t) => t === 'turn-end')).toHaveLength(1);
+    expect(notes(events)).toEqual([]);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(TURN_IDLE_GRACE_MS);
+  }, 30_000);
+
+  it('a POST that drops on a session that then DIES is still reported', async () => {
+    const runner = new OpencodeServerRunner({ bin: mockBin, timeoutMs: 60_000 });
+    const { events, onEvent } = record();
+    const session = runner.startSession({ userPrompt: 'do it #drop-then-die', cwd: process.cwd() }, onEvent, {
+      autoEndAfterFirstTurn: true,
+    });
+    await session.result;
+
+    // Swallowing the drop must not swallow a real failure: no `session.idle`
+    // ever arrived, so the drop was never explained and the note stands.
+    expect(notes(events).join(' ')).toContain('opencode: prompt failed:');
+    expect(types(events).filter((t) => t === 'turn-end')).toHaveLength(1);
+  }, 30_000);
+
+  it('a prompt sent while a turn is still running supersedes it instead of hanging it', async () => {
+    const runner = new OpencodeServerRunner({ bin: mockBin, timeoutMs: 60_000 });
+    const { events, onEvent } = record();
+    const session = runner.startSession({ userPrompt: 'check the tree', cwd: process.cwd() }, onEvent, {});
+    // `sendMessage` queues behind `ready`, so only once the FIRST turn is over
+    // can two prompts genuinely overlap — which they do the moment the cockpit
+    // delivers a second message into a task that is still running (#986).
+    await afterTurnEnds(events, 1);
+
+    expect(session.sendMessage([{ type: 'text', text: 'watch CI #drop-post' }])).toBe(true);
+    expect(session.sendMessage([{ type: 'text', text: 'actually, do this instead' }])).toBe(true);
+    await afterTurnEnds(events, 2);
+
+    // The superseded prompts' waiters settle, but only the wire's idle ends the
+    // turn: a superseding prompt is not a turn end (#2097), or the workflow's
+    // auto-nudge answers each one with another prompt until its budget is gone.
+    await afterTurnEnds(events, 2);
+    await new Promise((r) => setTimeout(r, 500));
+    expect(types(events).filter((t) => t === 'turn-end')).toHaveLength(2);
+
+    session.end();
+    await session.result;
+  }, 30_000);
+
+  it('a prompt sent mid-turn does not synthesize a turn-end of its own (#2097)', async () => {
+    const runner = new OpencodeServerRunner({ bin: mockBin, timeoutMs: 60_000 });
+    const { events, onEvent } = record();
+    const session = runner.startSession({ userPrompt: 'check the tree', cwd: process.cwd() }, onEvent, {});
+    await afterTurnEnds(events, 1);
+    session.sendMessage([{ type: 'text', text: 'watch CI #drop-post' }]);
+    await new Promise((r) => setTimeout(r, 15));
+    const endsAtSend = types(events).filter((t) => t === 'turn-end').length;
+    session.sendMessage([{ type: 'text', text: 'child report' }]);
+    await new Promise((r) => setTimeout(r, 100));
+    // Only the wire's own idle may add the one real end.
+    expect(types(events).filter((t) => t === 'turn-end').length).toBeLessThanOrEqual(endsAtSend + 1);
+    session.end();
+    await session.result;
+  }, 30_000);
+
+  it('sums V1 usage across distinct messages and counts a repeated one once (#2101)', async () => {
+    const runner = new OpencodeServerRunner({ bin: mockBin, timeoutMs: 60_000 });
+    const { events, onEvent } = record();
+    const session = runner.startSession({ userPrompt: 'check the tree', cwd: process.cwd() }, onEvent, { autoEndAfterFirstTurn: true });
+    await session.result;
+    const absorb = (session as unknown as { absorbUsage(i: Record<string, unknown>): void }).absorbUsage.bind(session);
+    const msg = (id: string, input: number, output: number, reasoning: number, cost: number) =>
+      ({ id, cost, tokens: { input, output, reasoning, cache: { read: 500, write: 0 } } });
+    const baseTokens = Math.max(0, ...events.flatMap((e) => (e.type === 'token-usage' ? [e.tokensUsed] : [])));
+    const baseUsd = events.flatMap((e) => (e.type === 'cost' ? [e.usd] : [])).reduce((a, b) => a + b, 0);
+    absorb(msg('msg_1', 100, 10, 2, 0.01));
+    absorb(msg('msg_1', 100, 10, 2, 0.01));
+    absorb(msg('msg_2', 50, 5, 1, 0.005));
+    const tokens = events.flatMap((e) => (e.type === 'token-usage' ? [e.tokensUsed] : []));
+    const usd = events.flatMap((e) => (e.type === 'cost' ? [e.usd] : [])).reduce((a, b) => a + b, 0);
+    expect(Math.max(...tokens)).toBe(baseTokens + 168);
+    expect(usd - baseUsd).toBeCloseTo(0.015, 6);
+  }, 30_000);
+
+  it('with no event bus at all the HTTP response stays the turn boundary', async () => {
+    const runner = new OpencodeServerRunner({ bin: mockBin, timeoutMs: 60_000 });
+    const { events, onEvent } = record();
+    const session = runner.startSession(
+      { userPrompt: 'check the tree #no-idle', cwd: process.cwd(), env: { MOCK_NO_EVENT_BUS: '1' } },
+      onEvent,
+      { autoEndAfterFirstTurn: true },
+    );
+    const started = Date.now();
+    await session.result;
+
+    // Nothing to wait for, so no grace window is spent.
+    expect(types(events).filter((t) => t === 'turn-end')).toHaveLength(1);
+    expect(Date.now() - started).toBeLessThan(TURN_IDLE_GRACE_MS);
+  }, 30_000);
+
+  it('reopens a requested session with GET before sending the continuation prompt', async () => {
+    const runner = new OpencodeServerRunner({ bin: mockBin, timeoutMs: 60_000 });
+    const { events, onEvent } = record();
+    const session = runner.startSession(
+      { userPrompt: 'continue the existing task', cwd: process.cwd(), sessionId: 'ses_mock_1', resume: true },
+      onEvent,
+      { autoEndAfterFirstTurn: true },
+    );
+    const result = await session.result;
+
+    expect(result.sessionId).toBe('ses_mock_1');
+    expect(types(events)).toContain('session');
+    expect(types(events).filter((t) => t === 'turn-end')).toHaveLength(1);
+    expect(result.text).toContain('Checking the working tree.');
+  }, 30_000);
+
+  it('a resume the server answers 404 fails with the missing-session marker and posts no prompt', async () => {
+    const runner = new OpencodeServerRunner({ bin: mockBin, timeoutMs: 60_000 });
+    const { events, onEvent } = record();
+    const session = runner.startSession(
+      { userPrompt: 'continue the existing task', cwd: process.cwd(), sessionId: 'ses_gone', resume: true },
+      onEvent,
+      { autoEndAfterFirstTurn: true },
+    );
+    await session.result;
+
+    const errors = events.filter((e): e is Extract<AgentEvent, { type: 'error' }> => e.type === 'error');
+    expect(errors).toHaveLength(1);
+    expect(isOpencodeMissingSessionError(errors[0]!.message)).toBe(true);
+    expect(types(events)).not.toContain('session');
+    expect(types(events)).not.toContain('turn-end');
+  }, 30_000);
+});
+
+describe('permission prompts outside the worktree (c3d30076 hung 21 h on one)', () => {
+  const mockBin = join(dirname(fileURLToPath(import.meta.url)), '__fixtures__', 'opencode', 'mock-opencode-serve.mjs');
+  const runs = '/repo/.ai/cezar/runs';
+  const env = { CEZ_HANDOFF_FILE: `${runs}/r1.handoff.md`, CEZ_TASK_ID: 'r1' };
+  const ask = (filepath: string, permission = 'external_directory') => ({
+    id: 'per_1',
+    permission,
+    patterns: [`${dirname(filepath)}/*`],
+    metadata: { filepath },
+  });
+
+  it('grants exactly this run\'s handoff file and its own pasted attachments', () => {
+    expect(opencodePermissionReply(ask(`${runs}/r1.handoff.md`), env)).toBe('once');
+    expect(opencodePermissionReply(ask(`${runs}/r1-images/pasted-1.png`), env)).toBe('once');
+  });
+
+  it('grants the dispatch tree, the artifacts dir and provisioned skill links, not siblings (#2115, #2103)', async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'oc-perm-')));
+    const tree = join(root, 'tree');
+    const arts = join(root, 'arts');
+    const cwd = join(root, 'wt');
+    const skill = join(root, 'shared', 'my-skill');
+    mkdirSync(join(tree, 'inbox'), { recursive: true });
+    mkdirSync(arts, { recursive: true });
+    mkdirSync(join(skill, 'references'), { recursive: true });
+    writeFileSync(join(skill, 'SKILL.md'), '---\nname: my-skill\n---\nBody\n');
+    mkdirSync(cwd, { recursive: true });
+    await provisionSkills(cwd, [{ name: 'my-skill', body: 'Body', path: join(skill, 'SKILL.md'), source: 'agents' }], []);
+    const e = { ...env, CEZ_TREE_DIR: tree, CEZ_ARTIFACTS_DIR: arts };
+    expect(opencodePermissionReply(ask(join(tree, 'units', 'x', 'order.md')), e, cwd)).toBe('once');
+    expect(opencodePermissionReply(ask(join(tree, 'inbox', 'r1', 'm.md')), e, cwd)).toBe('once');
+    expect(opencodePermissionReply(ask(join(arts, 'a.html')), e, cwd)).toBe('once');
+    expect(opencodePermissionReply(ask(join(skill, 'references', 'required.md')), e, cwd)).toBe('once');
+    expect(opencodePermissionReply(ask(join(root, 'shared', 'other', 'x.md')), e, cwd)).toBe('reject');
+    expect(opencodePermissionReply(ask(join(root, 'tree-sibling', 'x.md')), e, cwd)).toBe('reject');
+    expect(opencodePermissionReply(ask(join(tree, '..', 'x.md')), e, cwd)).toBe('reject');
+    expect(opencodePermissionReply(ask(join(tree, 'brief.md')), env, cwd)).toBe('reject');
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it('never follows a committed or agent-made skill link (#2103)', () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'oc-perm-')));
+    const cwd = join(root, 'wt');
+    const secret = join(root, 'home');
+    mkdirSync(join(secret, '.ssh'), { recursive: true });
+    mkdirSync(join(cwd, '.agents', 'skills'), { recursive: true });
+    mkdirSync(join(cwd, '.claude', 'skills'), { recursive: true });
+    symlinkSync(secret, join(cwd, '.agents', 'skills', 'evil'), 'dir');
+    symlinkSync('/', join(cwd, '.claude', 'skills', 'root'), 'dir');
+    expect(opencodePermissionReply(ask(join(secret, '.ssh', 'id_ed25519')), env, cwd)).toBe('reject');
+    expect(opencodePermissionReply(ask('/etc/passwd'), env, cwd)).toBe('reject');
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it('refuses everything else outside the worktree', () => {
+    expect(opencodePermissionReply(ask(`${runs}/r2.handoff.md`), env)).toBe('reject');
+    expect(opencodePermissionReply(ask(`${runs}/r1.ndjson`), env)).toBe('reject');
+    expect(opencodePermissionReply(ask(`${runs}/r2-images/pasted-1.png`), env)).toBe('reject');
+    expect(opencodePermissionReply(ask(`${runs}/r1-images/../r2.handoff.md`), env)).toBe('reject');
+    expect(opencodePermissionReply(ask(`${runs}/r1-images/nested/x.png`), env)).toBe('reject');
+    expect(opencodePermissionReply(ask('/etc/passwd'), env)).toBe('reject');
+    expect(opencodePermissionReply(ask(`${runs}/r1.handoff.md`, 'bash'), env)).toBe('reject');
+  });
+
+  it('grants anything under the run\'s own TMPDIR, and only when cezar set it there', () => {
+    const tmp = agentTmpDir('/repo/.ai/cezar', 'r1');
+    const withTmp = { ...env, TMPDIR: tmp };
+    expect(opencodePermissionReply(ask(`${tmp}/build/out.log`), withTmp)).toBe('once');
+    expect(opencodePermissionReply(ask(`${tmp}/build/out.log`), env)).toBe('reject');
+    expect(opencodePermissionReply(ask(`${dirname(tmp)}/r2/x`), withTmp)).toBe('reject');
+    expect(opencodePermissionReply(ask(`${tmp}-other/x`), withTmp)).toBe('reject');
+    // #999: the pre-move in-checkout location is no longer this run's scratch.
+    const legacy = '/repo/.ai/cezar/tmp/r1';
+    expect(opencodePermissionReply(ask(`${legacy}/x`), { ...env, TMPDIR: legacy })).toBe('reject');
+    expect(opencodePermissionReply(ask('/tmp/x'), { ...env, TMPDIR: '/tmp' })).toBe('reject');
+  });
+
+  it('compares paths after following symlinks', () => {
+    const root = mkdtempSync(join(tmpdir(), 'cez-oc-perm-'));
+    try {
+      mkdirSync(join(root, 'data', 'runs', 'r1-images'), { recursive: true });
+      symlinkSync(join(root, 'data'), join(root, 'link'));
+      symlinkSync('/etc', join(root, 'data', 'runs', 'r1-images', 'escape'));
+      const viaLink = { CEZ_HANDOFF_FILE: join(root, 'link', 'runs', 'r1.handoff.md'), CEZ_TASK_ID: 'r1' };
+      // OpenCode reports the real path; cezar handed out the symlinked one.
+      expect(opencodePermissionReply(ask(join(root, 'data', 'runs', 'r1.handoff.md')), viaLink)).toBe('once');
+      expect(opencodePermissionReply(ask(join(root, 'data', 'runs', 'r1-images', 'a.png')), viaLink)).toBe('once');
+      expect(opencodePermissionReply(ask(join(root, 'link', 'runs', 'r1-images', 'escape', 'hosts')), viaLink)).toBe('reject');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses when the run has no handoff file to compare against', () => {
+    expect(opencodePermissionReply(ask(`${runs}/r1.handoff.md`), undefined)).toBe('reject');
+    expect(opencodePermissionReply({ id: 'per_1', permission: 'external_directory' }, env)).toBe('reject');
+  });
+
+  for (const [label, path, reply, legacy] of [
+    ['the handoff file is approved', `${runs}/r1.handoff.md`, 'once', false],
+    ['another path is refused', `${runs}/r2.handoff.md`, 'reject', false],
+    ['a pre-rework server is answered on its session route', `${runs}/r1.handoff.md`, 'once', true],
+  ] as const) {
+    it(`a turn blocked on a prompt finishes: ${label}`, async () => {
+      const runEnv = legacy ? { ...env, MOCK_LEGACY_PERMISSION: '1' } : env;
+      const runner = new OpencodeServerRunner({ bin: mockBin, timeoutMs: 60_000 });
+      const events: AgentEvent[] = [];
+      const session = runner.startSession(
+        { userPrompt: `read it #permission ${path}`, cwd: process.cwd(), env: runEnv },
+        (e) => events.push(e),
+        { autoEndAfterFirstTurn: true },
+      );
+      const result = await session.result;
+      expect(result.text).toContain(`permission ${reply}`);
+      const notes = events.filter((e) => e.type === 'note').map((e) => (e as { message: string }).message);
+      expect(notes).toEqual(reply === 'reject' ? [`opencode: refused external_directory permission for ${path}`] : []);
+    }, 30_000);
+  }
+});
+
+/** #2042: an attended run asks the user instead of refusing behind their back. */
+describe('#2042 a permission prompt in an interactive session', () => {
+  const mockBin = join(dirname(fileURLToPath(import.meta.url)), '__fixtures__', 'opencode', 'mock-opencode-serve.mjs');
+  const env = { CEZ_HANDOFF_FILE: '/repo/.ai/cezar/runs/r1.handoff.md', CEZ_TASK_ID: 'r1' };
+
+  async function answered(prompt: string, answer: string, canAsk: (() => boolean) | null = () => true) {
+    const events: AgentEvent[] = [];
+    const asks: Array<{ requestId: string; questions: Array<{ question: string; options: Array<{ label: string }> }> }> = [];
+    /** Cards raised while a reply was still being delivered — the caller would overwrite their park. */
+    let raisedInsideSend = 0;
+    let sending = false;
+    const session = new OpencodeServerRunner({ bin: mockBin, timeoutMs: 30_000 }).startSession(
+      { userPrompt: prompt, cwd: process.cwd(), env },
+      (e) => {
+        events.push(e);
+        if (e.type === 'turn-end') session.end();
+      },
+      {
+        onUiEvent: (e) => {
+          if (e.type !== 'ask.requested') return;
+          if (sending) raisedInsideSend++;
+          asks.push(e as never);
+          // A person answers later, by which time every prompt of the turn is queued.
+          setTimeout(() => {
+            sending = true;
+            session.sendMessage([{ type: 'text', text: answer }]);
+            sending = false;
+          }, 100);
+        },
+        ...(canAsk ? { canAskPermission: canAsk } : {}),
+      },
+    );
+    const result = await session.result;
+    const notes = events.filter((e) => e.type === 'note').map((e) => (e as { message: string }).message);
+    return { result, asks, notes, raisedInsideSend };
+  }
+
+  it('shows a card and replies with the option the user picked', async () => {
+    const { result, asks, notes } = await answered('write it #permission /home/u/probe.txt', 'Permission: Allow once');
+    expect(asks).toHaveLength(1);
+    expect(asks[0]?.requestId).toBe('opencode-permission-per_mock_1');
+    expect(asks[0]?.questions[0]?.question).toBe('OpenCode asks for external_directory permission for /home/u/probe.txt. Allow it?');
+    expect(asks[0]?.questions[0]?.options.map((o) => o.label)).toEqual(['Allow once', 'Always allow', 'Reject']);
+    expect(result.text).toContain('permission once');
+    expect(notes).toEqual([]);
+  }, 30_000);
+
+  it('refuses on free text and passes the words on to the agent', async () => {
+    const { result } = await answered('write it #permission /home/u/probe.txt', 'no, use the worktree');
+    expect(result.text).toContain('permission reject (no, use the worktree)');
+  }, 30_000);
+
+  it('asks queued prompts one at a time, each only after the previous reply', async () => {
+    const { result, asks, raisedInsideSend } = await answered('write #permission /home/u/a.txt #permission /home/u/b.txt', 'Allow once');
+    expect(asks.map((a) => a.requestId)).toEqual(['opencode-permission-per_mock_1', 'opencode-permission-per_mock_1_2']);
+    expect(raisedInsideSend).toBe(0);
+    expect(result.text).toContain('permission once, once');
+  }, 30_000);
+
+  it('refuses without a card when nobody can answer (autonomous or headless run)', async () => {
+    for (const canAsk of [null, () => false]) { // null = the option is absent
+      const { result, asks, notes } = await answered('write it #permission /home/u/probe.txt', 'Allow once', canAsk);
+      expect(asks).toEqual([]);
+      expect(result.text).toContain('permission reject');
+      expect(notes).toEqual(['opencode: refused external_directory permission for /home/u/probe.txt']);
+    }
+  }, 60_000);
+
+  it('still grants this run\'s own handoff file without asking', async () => {
+    const { result, asks } = await answered(`read it #permission ${env.CEZ_HANDOFF_FILE}`, 'Reject');
+    expect(asks).toEqual([]);
+    expect(result.text).toContain('permission once');
+  }, 30_000);
+});
+
+describe('permissionAnswer', () => {
+  it('maps each option, case-insensitively, and anything else to a refusal', () => {
+    expect(permissionAnswer('Always allow')).toEqual({ reply: 'always' });
+    expect(permissionAnswer('Permission: reject')).toEqual({ reply: 'reject' });
+    expect(permissionAnswer(' allow once ')).toEqual({ reply: 'once' });
+    expect(permissionAnswer('maybe later')).toEqual({ reply: 'reject', message: 'maybe later' });
+  });
+});
+
+/**
+ * A spent OpenCode free tier puts the session in `retry` with `next` at the next day and no
+ * event in between; an interactive step has no wall clock, so the run held its slot for 11 h.
+ */
+describe('a session.status retry the turn cannot outwait', () => {
+  const mockBin = join(dirname(fileURLToPath(import.meta.url)), '__fixtures__', 'opencode', 'mock-opencode-serve.mjs');
+  const errors = (events: AgentEvent[]): string[] =>
+    events.filter((e): e is Extract<AgentEvent, { type: 'error' }> => e.type === 'error').map((e) => e.message);
+
+  it('fails a quota retry with a message that books the usage-limit resume', async () => {
+    const events: AgentEvent[] = [];
+    // `next` is an epoch instant; the resume must land on exactly it, whatever the host's zone.
+    const next = Date.now() + 3 * 60 * 60_000 + 123;
+    const session = new OpencodeServerRunner({ bin: mockBin, timeoutMs: 0 }).startSession(
+      { userPrompt: 'do it #retry-limit', cwd: process.cwd(), env: { MOCK_RETRY_NEXT: String(next) } },
+      (e) => events.push(e),
+      {},
+    );
+    await session.result;
+
+    expect(errors(events)).toHaveLength(1);
+    const [error] = errors(events);
+    expect(error).toMatch(/^opencode: usage limit reached: Free usage exceeded, subscribe to Go — retry at /);
+    expect(parseUsageLimit(error)).toEqual({ resetAt: new Date(next), evidence: 'timestamp' });
+    expect(events.at(-1)?.type).toBe('done');
+  }, 30_000);
+
+  async function retryErrors(status: Record<string, unknown>, env: Record<string, string> = {}, timeoutMs = 0): Promise<string[]> {
+    const events: AgentEvent[] = [];
+    const session = new OpencodeServerRunner({ bin: mockBin, timeoutMs }).startSession(
+      { userPrompt: 'do it #retry-limit', cwd: process.cwd(), env: { MOCK_RETRY_STATUS: JSON.stringify(status), ...env } },
+      (e) => events.push(e),
+      {},
+    );
+    await session.result;
+    return errors(events);
+  }
+
+  it('fails a long backoff with no action, and resumes only on a limit OpenCode names', async () => {
+    const next = Date.now() + 60 * 60_000;
+    const [error, ...rest] = await retryErrors({ message: 'Provider is overloaded', next });
+    expect(rest).toEqual([]);
+    expect(error).toBe(`opencode: Provider is overloaded — retry at ${new Date(next).toISOString()}`);
+    expect(parseUsageLimit(error)).toBeNull();
+  }, 30_000);
+
+  it('never books a resume for an action that is not a quota', async () => {
+    const next = Date.now() + 60 * 60_000;
+    const [error] = await retryErrors({
+      message: 'Rate limit: sign in again',
+      action: { reason: 'auth_required', provider: 'opencode', title: 'Sign in', message: 'Sign in', label: 'sign in' },
+      next,
+    });
+    expect(error).toBe(`opencode: Rate limit: sign in again — next attempt ${new Date(next).toISOString()}`);
+    expect(parseUsageLimit(error)).toBeNull();
+  }, 30_000);
+
+  it('fails a quota action with no retry instant, without inventing one', async () => {
+    const [error] = await retryErrors({
+      message: 'Go limit reached',
+      action: { reason: 'account_rate_limit', provider: 'opencode', title: 'Go limit reached', message: 'x', label: 'open settings' },
+    });
+    expect(error).toBe('opencode: usage limit reached: Go limit reached');
+    expect(parseUsageLimit(error)).toBeNull();
+  }, 30_000);
+
+  it("ignores another session's retry", async () => {
+    const status = { message: 'Free usage exceeded', action: { reason: 'free_tier_limit' }, next: Date.now() + 60 * 60_000 };
+    // Only the inactivity deadline ends this turn: the retry belongs to a subtask session.
+    expect(await retryErrors(status, { MOCK_RETRY_SESSION: 'ses_other' }, 1_500)).toEqual([
+      'opencode timed out after 2s without any output and was killed — Continue picks the task up again',
+    ]);
+  }, 30_000);
+
+  it('rides out a short transient retry', async () => {
+    const events: AgentEvent[] = [];
+    const session = new OpencodeServerRunner({ bin: mockBin, timeoutMs: 60_000 }).startSession(
+      { userPrompt: 'do it #retry-soon', cwd: process.cwd() },
+      (e) => events.push(e),
+      { autoEndAfterFirstTurn: true },
+    );
+    await session.result;
+
+    expect(errors(events)).toEqual([]);
+    expect(events.some((e) => e.type === 'turn-end')).toBe(true);
+  }, 30_000);
+});
+
+/** #1652: OpenCode's native `question` tool blocks the session until /question/:id/reply. */
+describe('#1652 a native question.asked', () => {
+  const mockBin = join(dirname(fileURLToPath(import.meta.url)), '__fixtures__', 'opencode', 'mock-opencode-serve.mjs');
+
+  it('shows an ask card and sends the next message back as the answer', async () => {
+    const asks: Array<{ requestId: string; questions: Array<{ header: string; options: unknown[] }> }> = [];
+    const session = new OpencodeServerRunner({ bin: mockBin, timeoutMs: 30_000 }).startSession(
+      { userPrompt: 'pick one #question', cwd: process.cwd() },
+      () => undefined,
+      {
+        autoEndAfterFirstTurn: true,
+        onUiEvent: (e) => {
+          if (e.type === 'ask.requested') {
+            asks.push(e as never);
+            session.sendMessage([{ type: 'text', text: 'Approach: Approach B' }]);
+          }
+        },
+      },
+    );
+    const result = await session.result;
+    expect(asks).toHaveLength(1);
+    expect(asks[0]?.questions[0]).toMatchObject({ header: 'Approach' });
+    expect(asks[0]?.questions[0]?.options).toHaveLength(2);
+    expect(result.text).toContain('question answered {"answers":[["Approach B"]]}');
+  }, 30_000);
+
+  it('rejects a question the card cannot show, so the session is not left blocked', async () => {
+    const events: AgentEvent[] = [];
+    const session = new OpencodeServerRunner({ bin: mockBin, timeoutMs: 30_000 }).startSession(
+      { userPrompt: 'pick one #question-free', cwd: process.cwd() },
+      (e) => events.push(e),
+      { autoEndAfterFirstTurn: true },
+    );
+    const result = await session.result;
+    expect(result.text).toContain('question rejected');
+  }, 30_000);
+});
+
+/** #1896: the chat renders the v1 `image` event, so the runner must emit it, once. */
+describe('#1896 an image a read tool returns as an attachment', () => {
+  const mockBin = join(dirname(fileURLToPath(import.meta.url)), '__fixtures__', 'opencode', 'mock-opencode-serve.mjs');
+
+  it('emits one v1 and one v2 image per part, skipping non-image attachments and repeated snapshots', async () => {
+    const v1: AgentEvent[] = [];
+    const v2: UiEvent[] = [];
+    const session = new OpencodeServerRunner({ bin: mockBin, timeoutMs: 30_000 }).startSession(
+      { userPrompt: 'look at the screenshot #image-read', cwd: process.cwd() },
+      (e) => v1.push(e),
+      { autoEndAfterFirstTurn: true, onUiEvent: (e) => v2.push(e) },
+    );
+    await session.result;
+    expect(v1.filter((e) => e.type === 'image')).toEqual([{ type: 'image', mediaType: 'image/png', data: 'iVBORw0KGgo=' }]);
+    expect(v2.filter((e) => e.type === 'image')).toEqual([
+      { type: 'image', itemId: 'prt_img', mediaType: 'image/png', data: 'iVBORw0KGgo=' },
+    ]);
+  }, 30_000);
+});

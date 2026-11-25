@@ -12,8 +12,8 @@ const PORT = Number(process.env.AZURON_PORT || 45160);
 const URL = `http://127.0.0.1:${PORT}`;
 
 const rootDir = path.resolve(import.meta.dirname, '..');
-const serverEntry = path.join(rootDir, 'packages', 'server', 'dist', 'index.js');
-const serverTsEntry = path.join(rootDir, 'packages', 'server', 'src', 'index.ts');
+const serverEntry = path.join(rootDir, 'packages', 'cezar', 'dist', 'index.js');
+const serverTsEntry = path.join(rootDir, 'packages', 'cezar', 'src', 'index.ts');
 
 function getRunningPid() {
   if (!fs.existsSync(PID_PATH)) return null;
@@ -44,14 +44,34 @@ async function cmdStart() {
   }
   const entry = fs.existsSync(serverEntry) ? serverEntry : serverTsEntry;
   const args = ['--max-old-space-size=256'];
-  if (entry.endsWith('.ts')) args.push('--experimental-strip-types');
-  args.push(entry);
+  if (entry.endsWith('.ts')) {
+    args.push('--import', 'tsx');
+  }
+  args.push(entry, '--port', String(PORT), '--no-open');
+
+  // Ensure logs directory exists
+  fs.mkdirSync(path.dirname(LOG_PATH), { recursive: true });
 
   const child = spawn(process.execPath, args, {
     stdio: 'inherit',
-    env: { ...process.env, AZURON_PORT: String(PORT) },
+    cwd: rootDir,
+    env: {
+      ...process.env,
+      AZURON_HOME,
+      CEZ_HOME: AZURON_HOME,
+      AZ_HOME: AZURON_HOME,
+      PORT: String(PORT),
+    },
   });
-  child.on('exit', (code) => process.exit(code ?? 0));
+
+  if (child.pid) {
+    fs.writeFileSync(PID_PATH, String(child.pid), 'utf8');
+  }
+
+  child.on('exit', (code) => {
+    if (fs.existsSync(PID_PATH)) fs.unlinkSync(PID_PATH);
+    process.exit(code ?? 0);
+  });
 }
 
 function cmdStop() {

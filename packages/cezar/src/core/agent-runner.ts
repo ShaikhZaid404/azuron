@@ -1,0 +1,342 @@
+/**
+ * The backend-agnostic seam for running one agent task. Adapted from
+ * @cezar/core's `agents/agent-runner.ts`, trimmed for single-user local use:
+ * no token-budget circuit breaker, no zod response schemas — one run is one
+ * agent-CLI session streaming normalized events.
+ *
+ * Interchangeable backends (one per `RUNNER_IDS` entry) implement this seam, each as a persistent
+ * process so multi-turn follow-ups, `waiting`, interrupt and resume all work:
+ *  - `claude`   — Claude Code CLI, stream-json over stdin/stdout;
+ *  - `codex`    — `codex app-server`, JSON-RPC 2.0 (JSONL) over stdin/stdout;
+ *  - `opencode` — `opencode serve`, HTTP + SSE;
+ *  - `cursor`   — Cursor Agent CLI, headless print mode (`stream-json`);
+ *  - `pi`       — pi coding CLI, RPC over JSONL stdin/stdout, selecting its
+ *                 model with `provider/model`;
+ *  - `junie`    — JetBrains Junie CLI, real Agent Client Protocol (ACP:
+ *                 `junie --acp=true`), JSON-RPC 2.0 (JSONL) over stdin/stdout;
+ *  - `copilot`  — GitHub Copilot CLI, ACP (JSON-RPC 2.0, JSONL) over stdin/stdout;
+ *  - `omp`      — OMP, pi's successor, the same RPC line protocol over stdio;
+ *  - `antigravity`, `gemini`, `kimi` — Google Antigravity CLI (stream-json), Gemini CLI and
+ *                 Kimi Code (both ACP over stdio).
+ */
+
+import {
+  REASONING_EFFORT_RUNNERS,
+  runnerSchema,
+  runnerSupportsReasoningEffort,
+  type Runner,
+} from '@open-mercato/cezar-contract';
+import type { UsageWindowsObservation } from '@open-mercato/cezar-contract';
+import type { UiEvent } from './ui-events.ts';
+import type { PrivateMcpServer } from './private-mcp.ts';
+
+/**
+ * The user-selectable runners (what config/GUI expose), in display order. The set is written down
+ * ONCE — the contract's `runnerSchema` in `packages/contract/src/health.ts` — and re-exported here
+ * so every runtime enumeration (zod schemas, the server-install "at least one agent CLI" gate, the
+ * CLI-handoff registry) derives from the one tuple rather than repeating the literals: adding a
+ * runner is a one-line change there, and typecheck plus `runner-union.test.ts` find the rest.
+ */
+export const RUNNER_IDS = runnerSchema.options;
+
+/** The user-selectable runners (what config/GUI expose). */
+export type RunnerId = Runner;
+
+/** `claude-cli` is the legacy id kept so old run records still parse. */
+export type AgentBackend = RunnerId | 'claude-cli';
+
+/** Narrow an arbitrary string (a config value, a check name) to a runner id. */
+export function isRunnerId(value: string): value is RunnerId {
+  return (RUNNER_IDS as readonly string[]).includes(value);
+}
+
+/** Historical default: unrestricted shell access, not a capability boundary. */
+export const DEFAULT_ALLOWED_TOOLS = ['Read', 'Edit', 'Write', 'Grep', 'Glob', 'Bash'];
+
+/** A shell command a restricted Codex broker may run: one argv per pipe stage, plus a heredoc body. */
+export type BrokeredShellPlan = { ok: true; pipeline: string[][]; stdin?: string } | { ok: false; reason: string };
+
+export interface BrokeredShell {
+  verify(command: string): BrokeredShellPlan;
+  /** The environment approved commands run in; the broker adds nothing to it. */
+  env: Record<string, string | undefined>;
+  /** What the model is told the shell is for, appended to the tool description. */
+  describe: string;
+  /** Programs that reach nothing beyond the loopback cockpit. Under `CEZ_CODEX_NETWORK=0` a
+   *  pipeline runs only when every stage is one of these; absent, every command is refused then. */
+  offlinePrograms?: readonly string[];
+}
+
+export interface AgentRunSpec {
+  /** Optional account usage metadata from ordinary activity. Bind to the resolved step account. */
+  onUsageWindows?: (observation: UsageWindowsObservation) => void;
+  /** Appended to the CLI's default system prompt (`--append-system-prompt`). */
+  systemPrompt?: string;
+  userPrompt: string;
+  /** Image blocks delivered with the first user message — screenshots pasted
+   *  into the new-task form (spec 002's paste path, at task start). */
+  images?: ContentBlock[];
+  /** The directory the agent runs in — also the only writable root. */
+  cwd: string;
+  /** Tool allowlist; the CLI is default-deny for anything not listed — but
+   *  the zero-config default (`DEFAULT_ALLOWED_TOOLS`) includes `Bash`
+   *  unrestricted unless `bashAllowlist` is set, so treat the default as
+   *  full shell access in `cwd`, not a sandboxed allowlist (#430). */
+  allowedTools?: string[];
+  /** When `Bash` is allowed, restrict it to commands starting with one of these. */
+  bashAllowlist?: string[];
+  /** Claude only: a PreToolUse hook command that allows or denies each Bash call. `bashAllowlist`
+   *  stays the floor when the hook gives no answer or cannot run. Other backends ignore it. */
+  bashHookCommand?: string;
+  /** Codex only: the shell a restricted session's broker may run on the host — a manager's
+   *  `cez-manager` and read-only `gh` (the fence Claude enforces through `bashHookCommand`).
+   *  `verify` is the whole policy: it returns the argv pipeline to spawn, never a shell string. */
+  brokeredShell?: BrokeredShell;
+  /** Claude only: skip every permission prompt (`--permission-mode bypassPermissions`), the
+   *  project's opt-in `bypassPermissions`. `enforceReadOnly` wins. Other backends ignore it. */
+  bypassPermissions?: boolean;
+  /** Claude only: `sandbox.excludedCommands` patterns, for a command that must reach the loopback
+   *  cockpit the user's Bash sandbox blocks (a manager's `cez-manager`). Other backends ignore it. */
+  sandboxExcludedCommands?: string[];
+  /** Extra directories the agent may read/write besides `cwd`. */
+  additionalDirectories?: string[];
+  /** Must not change the repository or publish anything, enforced by each backend's own control
+   *  (AGENT_PROTOCOL.md); a runner that cannot has to fail the run. Set only for a manager's
+   *  read-only work: an Ask task's read-only tools are not this (spec 2026-10-31-managers). */
+  enforceReadOnly?: boolean;
+  /** Extra env vars for the agent process (merged over `process.env`) —
+   *  e.g. CEZ_HANDOFF_FILE / CEZ_TODOS_FILE / CEZ_TASK_ID (spec 007). */
+  env?: Record<string, string>;
+  /** The project's private MCP servers (`.ai/cezar/mcp.local.json`), injected at launch through
+   *  each backend's own channel — never written into `cwd` (spec 2026-10-07-private-project-mcp). */
+  mcpServers?: PrivateMcpServer[];
+  /** Claude only: load no MCP server and no claude.ai connector (`--strict-mcp-config` with no
+   *  config). For a manager turn that may call none: their tool lists and instructions otherwise
+   *  fill its context on every turn (spec 2026-11-21-manager-short-sessions-and-memory § 2.4). */
+  noMcpServers?: boolean;
+  /** Claude only: extra settings (e.g. a `PreToolUse` hook) for `--settings`, written to a `0600`
+   *  temp file, never inline in argv. Other backends ignore it, so never rely on it elsewhere. */
+  claudeSettings?: Record<string, unknown>;
+  model?: string;
+  /**
+   * Reasoning effort for this session (Codex `turn/start.effort`, Claude `--effort`). Omitted
+   * preserves the native agent default; other backends reject an explicit value.
+   */
+  reasoningEffort?: string;
+  /** Inactivity kill switch for the run (ms): no output for this long stops it; 0 disables. */
+  timeoutMs?: number;
+  /**
+   * Stable session id (UUID) so the user can take over interactively later:
+   * `cd <repo> && claude --resume <sessionId>`.
+   */
+  sessionId?: string;
+  /**
+   * Spawn `claude --resume <sessionId>` instead of starting a fresh session —
+   * picks up the on-disk conversation (used by "Continue" after a run ends).
+   */
+  resume?: boolean;
+}
+
+/**
+ * Backends without a replaceable system-prompt channel (codex app-server,
+ * opencode serve) deliver `spec.systemPrompt` as a leading block of the
+ * opening user message — the documented per-backend mapping (spec §protocol
+ * v2: claude = `--append-system-prompt`, codex/opencode = prepended here).
+ */
+export function prependSystemPrompt(systemPrompt: string | undefined, userPrompt: string): string {
+  return systemPrompt ? `${systemPrompt}\n\n---\n\n${userPrompt}` : userPrompt;
+}
+
+export { REASONING_EFFORT_RUNNERS, runnerSupportsReasoningEffort };
+
+export const REASONING_EFFORT_UNSUPPORTED_ERROR = 'reasoning effort is only supported by the Codex and Claude runners';
+
+/** Keep the backend-specific setting from being silently ignored at the runner seam. */
+export function assertReasoningEffortSupported(
+  backend: AgentBackend,
+  reasoningEffort: string | undefined,
+): void {
+  if (reasoningEffort && !runnerSupportsReasoningEffort(backend)) {
+    throw new Error(REASONING_EFFORT_UNSUPPORTED_ERROR);
+  }
+}
+
+/**
+ * True for the `128 + signal` exit codes an agent CLI reports when it handles
+ * a stop signal itself instead of dying from it (SIGINT/SIGKILL/SIGTERM).
+ *
+ * Every runner arms a SIGTERM→SIGKILL watchdog on `end()` and signals on
+ * `interrupt()` (#703): the CLIs install their own handlers, so a session the
+ * runner tore down on purpose comes back as a NON-ZERO exit. Paired with a
+ * "we sent the signal" flag, this predicate keeps that teardown out of the
+ * error path — an exit cezar caused is never an agent failure.
+ */
+export function isSignalTerminationExit(exitCode: number | null): boolean {
+  return exitCode === 130 || exitCode === 137 || exitCode === 143;
+}
+
+/** The slice of `ChildProcess` a termination tracker needs — keeps the helper
+ *  usable from the transport layer and from test fakes alike. */
+export interface TrackableChild {
+  exitCode: number | null;
+  signalCode: NodeJS.Signals | null;
+  once(event: 'exit', listener: () => void): unknown;
+}
+
+/**
+ * Returns a predicate that answers "has this child actually terminated?".
+ *
+ * `ChildProcess.killed` answers a different question — it flips as soon as a
+ * signal is *delivered*, whether or not the child dies from it. Every agent CLI
+ * installs its own SIGTERM handler, so gating a SIGTERM→SIGKILL watchdog on
+ * `!child.killed` disables the escalation for exactly the child it exists for:
+ * `killed` is true, `exitCode` stays null, and the process outlives the whole
+ * grace window (#844, same defect fixed for the discovery probe in #841).
+ *
+ * Seeded from `exitCode`/`signalCode` so a child that died before the watchdog
+ * was armed is recognized without waiting for an event that already fired.
+ */
+export function trackChildExit(child: TrackableChild): () => boolean {
+  let exited = child.exitCode != null || child.signalCode != null;
+  child.once('exit', () => {
+    exited = true;
+  });
+  return () => exited;
+}
+
+/** One content block of a user message — mirrors the Anthropic wire format
+ *  so it can be written to the claude CLI's stdin verbatim. */
+export type ContentBlock =
+  | { type: 'text'; text: string }
+  | { type: 'image'; source: { type: 'base64'; media_type: string; data: string } };
+
+/**
+ * Why a turn ended, when the runner knows something the turn's TEXT cannot say.
+ *
+ * Additive and optional, in the shape `note.tone` already established
+ * (BACKWARD_COMPATIBILITY.md §7): every producer still emits a bare
+ * `{ type: 'turn-end' }` unless it has a reason, an old NDJSON recording that
+ * carries no `reason` replays exactly as it always did, and an unrecognized
+ * value degrades to "no reason given" rather than to an error.
+ *
+ *  - `context-compaction` — the turn's last act was the backend compacting its
+ *    OWN context window, with no assistant message or native ask after it
+ *    (#955). Internal session maintenance, never evidence that the user owns
+ *    the next action, so `RunManager` keeps the run working instead of parking
+ *    it under "Needs you".
+ */
+export type TurnEndReason = 'context-compaction';
+
+/** Normalized event stream — the GUI renders these, the store persists them. */
+export type AgentEvent =
+  | { type: 'text'; text: string }
+  | { type: 'tool-call'; id: string; tool: string; input: unknown }
+  | { type: 'tool-result'; toolCallId: string; result: string; isError: boolean }
+  /** An image inside a tool result (screenshot tools, Read on a PNG…) —
+   *  raw base64 here; the run manager persists it and re-emits a URL. */
+  | { type: 'image'; mediaType: string; data: string }
+  | { type: 'token-usage'; tokensUsed: number }
+  | { type: 'cost'; usd: number }
+  /** Live session gauges (context fill, plan usage windows) for the run header. Folded onto the
+   *  run record, never persisted as a transcript line. Each field is the latest reading. */
+  | { type: 'usage-status'; status: AgentUsageStatus }
+  /** The backend's real session id, once known — codex threads and opencode
+   *  sessions mint their own id, so the run manager persists this to enable
+   *  resume ("Continue") and "open in CLI". Claude's equals `spec.sessionId`. */
+  | { type: 'session'; sessionId: string }
+  /** The MCP servers and tool names the session loaded (Claude's `system/init`). Claude only; a
+   *  manager reads it for connectors (spec 2026-11-12-manager-connectors), a task ignores it. */
+  | { type: 'mcp-servers'; servers: Array<{ name: string; status: string }>; tools: string[] }
+  | { type: 'turn-end'; reason?: TurnEndReason }
+  | { type: 'note'; message: string }
+  | { type: 'done' }
+  | { type: 'error'; message: string };
+
+/** A plan usage window as the backend reports it (Claude: `rate_limit_event.unifiedWindows`). */
+export interface AgentUsageWindow {
+  /** Backend window key, e.g. `five_hour`, `seven_day`. */
+  window: string;
+  /** Fraction used, 0..1. */
+  utilization: number;
+  /** ISO-8601 instant the window resets. */
+  resetsAt: string;
+}
+
+export interface AgentUsageStatus {
+  /** Tokens in the main agent's context after its latest message. */
+  contextTokens?: number;
+  /** Of `contextTokens`, what that request wrote to the prompt cache (Claude only). */
+  cacheWriteTokens?: number;
+  contextWindow?: number;
+  limits?: AgentUsageWindow[];
+  /** A finished turn's own totals (Claude's result frame): what a manager turn's stats record. */
+  turnTokens?: { cacheReadTokens: number; cacheWriteTokens: number; outputTokens: number };
+}
+
+export interface AgentToolCallRecord {
+  id: string;
+  name: string;
+  input: unknown;
+}
+
+export interface AgentRunResult {
+  /** Concatenated assistant text across the run, trimmed. */
+  text: string;
+  toolCalls: AgentToolCallRecord[];
+  /** Cost-weighted token usage; 0 when the backend surfaced no telemetry. */
+  tokensUsed: number;
+  sessionId?: string;
+}
+
+export interface SessionOptions {
+  /** Close the session shortly after the first turn ends (single-turn
+   *  behavior, used for non-interactive workflow steps). Interactive
+   *  sessions omit this and control `end()` themselves. */
+  autoEndAfterFirstTurn?: boolean;
+  /** Protocol-v2 channel: receives the normalized `UiEvent` stream emitted
+   *  ALONGSIDE the v1 `AgentEvent`s (additive — v1 keeps flowing unchanged).
+   *  RunManager consumption lands in R2 step 2.1. */
+  onUiEvent?: (event: UiEvent) => void;
+  /** Can a human answer a backend permission prompt right now? Read when one arrives, so an
+   *  Autonomous toggle mid-run counts. Absent = nobody can: the runner answers it itself (#2042). */
+  canAskPermission?: () => boolean;
+}
+
+/**
+ * A live agent session over one spawned backend process. The process stays
+ * alive between turns and reads further user messages — that's what makes
+ * mid-task follow-ups possible. Implemented identically by every backend
+ * (claude stdin, codex app-server, opencode serve).
+ */
+export interface AgentSession {
+  /** Resolves when the backend process exits — the session is fully over. */
+  result: Promise<AgentRunResult>;
+  /** OS pid of the spawned backend process — the root of the run's process
+   *  tree (agents spawn Bash children under it). Absent when the spawn
+   *  failed before a pid existed. Feeds live resource telemetry (#348). */
+  readonly pid?: number;
+  /** Write a user message into the live session. False when it is closed. */
+  sendMessage(content: ContentBlock[]): boolean;
+  /** Graceful close: end input, then a SIGTERM→SIGKILL watchdog. */
+  end(): void;
+  /** Hard stop (used by cancel). */
+  interrupt(): void;
+  /** Escalate a cancellation to a bounded process kill when graceful interrupt is ignored. */
+  hardStop?(): void;
+  /** Resolves once the spawned backend process has exited, even when `result` cannot settle
+   *  because a surviving descendant still holds its stdout (#1929). */
+  readonly processExited?: Promise<void>;
+  /** True while the session still accepts messages. */
+  readonly open: boolean;
+}
+
+export interface AgentRunner {
+  readonly backend: AgentBackend;
+  run(spec: AgentRunSpec, onEvent?: (event: AgentEvent) => void): Promise<AgentRunResult>;
+  startSession(
+    spec: AgentRunSpec,
+    onEvent?: (event: AgentEvent) => void,
+    opts?: SessionOptions,
+  ): AgentSession;
+  interrupt(): Promise<void>;
+}

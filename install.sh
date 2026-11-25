@@ -78,10 +78,10 @@ else
   ok "Dependencies installed"
 fi
 
-if [ "$FORCE_INSTALL" = "0" ] && [ -f "$REPO_DIR/packages/contract/dist/index.js" ] && [ -f "$REPO_DIR/packages/server/dist/index.js" ] && [ -f "$REPO_DIR/packages/web/dist/index.html" ]; then
+if [ "$FORCE_INSTALL" = "0" ] && [ -f "$REPO_DIR/packages/cezar/dist/index.js" ] && [ -f "$REPO_DIR/packages/cezar/web/dist/index.html" ]; then
   ok "Build already exists (skipping npm run build; use --force to rebuild)"
 else
-  log "Building all packages (contract → server → web)..."
+  log "Building all packages (server + web)..."
   npm run build
   ok "Build complete"
 fi

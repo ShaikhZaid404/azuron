@@ -1,0 +1,767 @@
+import { queueWaitLabel } from '@/lib/queue-wait-label'
+import { MessageSquareTextIcon, SearchXIcon } from 'lucide-react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useLocation, useParams } from 'react-router'
+
+import { Link } from '@/lib/project-router'
+
+import { ApiError } from '@/api/client'
+import {
+  useEditQueuedMessage,
+  useMarkRunSeen,
+  usePatchRun,
+  useRemoveQueuedMessage,
+  useRun,
+  useProjectRepoBase,
+  useRunArtifacts,
+  useRuns,
+  useContinueRun,
+} from '@/api/queries'
+import { ReconnectSurfaceContext, type ReconnectSurface } from '@/components/reconnect/surface'
+import { ReconnectCard } from '@/components/reconnect/reconnect-card'
+import { useRunHistory, type RunHistoryState } from '@/api/run-history'
+import type { ApiRun } from '@open-mercato/cezar-api-client'
+import { MyMessagesPill } from '@/components/my-messages/my-messages-pill'
+import { CenteredState } from '@/components/centered-state'
+import { TaskLifecycleCard } from '@/components/worktree-lifecycle-operation'
+import { StatusDot } from '@/components/status-dot'
+import { Button } from '@/components/ui/button'
+import { IconTooltip } from '@/components/ui/icon-tooltip'
+import { useKeyboardInsetVar } from '@/lib/keyboard-inset'
+import { budgetStop, isAwaitingAnswer, isIdleClosed } from '@/lib/attention'
+import { isUnread } from '@/lib/read-state'
+import { taskIssueUrl, taskPrUrl } from '@/lib/tasks-table'
+import { isHttpUrl } from '@/lib/utils'
+
+import { AutoResumeHint } from './auto-resume-hint'
+import { useFinishRun } from './use-finish-run'
+import { usePromoteRun, useStartRunNow } from './use-start-run-now'
+import { E2eSetupVerdict } from './e2e-setup-verdict'
+import { useDraft } from './thread-draft'
+import { useDiffComments } from './diff-comments'
+import { TaskComposer, TaskDock } from './task-composer'
+import { WorkingIndicator } from './thread-items'
+import { useContinueAction } from './follow-up-engine'
+import { useDeliverPrompt } from './deliver-prompt'
+import { AgentsDock } from './agents-dock'
+import { PlanDock, planCounts } from './plan-dock'
+import { SkillsDock } from './skills-dock'
+import { collectSkills, collectSubagents, findSubagent, subagentChildren } from './subagent-dock'
+import { SubagentSheet } from './subagent-sheet'
+import { AcceptCelebration, ReviewPanel } from './review-panel'
+import { queuePosition, runActionFlags } from './run-actions'
+import { RunHeader } from './run-header'
+import { RunUsage } from './run-usage'
+import { AskCard } from './ask-card'
+import { FooterLabel, OutcomeCard } from './outcome-card'
+import { useRunRecordReconcile } from './run-reconcile'
+import { ThreadLoading } from './thread-loading'
+import { threadRenderMode } from './thread-scroll'
+import { JumpToLatestPill, useThreadScroll } from './thread-scroller'
+import { useThreadMyMessages } from './use-thread-my-messages'
+import {
+  SessionTranscript,
+  buildTranscriptRows,
+  mainTranscriptSections,
+  placeArtifactRows,
+  type TranscriptMessageActions,
+} from './session-transcript'
+import {
+  latestPlanEntries,
+  reduceThread,
+  trackedAsks,
+  threadFilePaths,
+  threadFooter,
+  type ThreadAsk,
+  type ThreadState,
+} from './thread-state'
+
+/**
+ * `/tasks/:id` — the Session tab (spec, "Task thread"): the run header (title/meta/tabs/
+ * actions — see run-header.tsx), turns with user bubbles, assistant markdown, tool cards,
+ * dim lifecycle lines, the closed footer, and the docked composer (plan dock · paused hint ·
+ * reply box).
+ *
+ * Data doctrine: `useRun` is authoritative for the record; `useRunHistory` hydrates a bounded
+ * visible transcript plus compact current-state context and falls back to `useRunEvents` when
+ * the optimized route is unavailable. The rendered rows go through the threshold-switched scroller
+ * (thread-scroller.tsx — flat, with content-visibility where scroll anchoring is available,
+ * below ~300 rows; virtua above).
+ */
+export function TaskThreadRoute() {
+  const { id } = useParams<{ id: string }>()
+  const run = useRun(id)
+  const history = useRunHistory(id)
+  const runStatus = run.data?.status
+  const asks = trackedAsks(run.data)
+  const thread = useMemo(
+    () => reduceThread(history.visibleEvents, { activeTurn: runStatus === 'running', runner: run.data?.runner, trackedAsks: asks }),
+    [history.visibleEvents, runStatus, run.data?.runner, asks],
+  )
+  const currentThread = useMemo(
+    () => reduceThread(history.currentEvents, { activeTurn: runStatus === 'running', runner: run.data?.runner, trackedAsks: asks }),
+    [history.currentEvents, runStatus, run.data?.runner, asks],
+  )
+
+  // Read receipt (#unread-done-items): opening a finished task's thread marks it read — the same
+  // "opening the mail clears the unread dot" move. Gated on `isUnread` so it fires only for a
+  // genuinely-unread done item, and keyed on the record's read-relevant fields so it converges:
+  // the optimistic `seenAt` flips `isUnread` false and the effect does not re-fire. A run that
+  // later resumes and re-finishes (its `finishedAt` moves past the receipt) marks read again.
+  //
+  // The one exception is "Mark unread" from this very thread (#775): clearing the receipt makes
+  // `isUnread` true again, which without a guard this effect would immediately undo — the action
+  // would look broken in exactly the place a user reaches for it. `suppressAutoRead` is that
+  // guard, and it holds the run id rather than a bare boolean: it only suppresses the run it was
+  // set for, for as long as that run stays on screen. Leaving it ends the visit — and that has to
+  // be cleared EXPLICITLY, because /tasks/A → /tasks/B → /tasks/A reuses this route element
+  // (React reconciles it, it does not remount), so a ref that only reset on mount survived the
+  // round trip and the task stayed unread however often it was reopened. That is the email
+  // grammar this is modelled on — reopening the mail marks it read again.
+  const suppressAutoRead = useRef<string | undefined>(undefined)
+  // Declared BEFORE the receipt effect below on purpose: effects run in order, so arriving on a
+  // run clears another run's suppression before the receipt decides whether to fire.
+  useEffect(() => {
+    if (suppressAutoRead.current !== id) suppressAutoRead.current = undefined
+  }, [id])
+  const suppressAutoReadFor = useCallback((runId: string) => {
+    suppressAutoRead.current = runId
+  }, [])
+  const { mutate: markRunSeen } = useMarkRunSeen()
+  useEffect(() => {
+    if (!run.data) return
+    if (suppressAutoRead.current === run.data.id) return
+    if (isUnread(run.data)) markRunSeen(run.data.id)
+  }, [
+    markRunSeen,
+    run.data?.id,
+    run.data?.status,
+    run.data?.finishedAt,
+    run.data?.seenAt,
+    // `isUnread` reads `archived` too, so it belongs here: un-archiving an open thread makes the
+    // run unread again, and without this dep the effect would never fire to clear it.
+    run.data?.archived,
+    // The route's id, not just the record's: coming back to a run whose cached record is
+    // unchanged must still re-run the receipt once the suppression above has been lifted.
+    id,
+  ])
+  // The two feeds can drift: a record update lost on the workspace stream leaves the thread
+  // showing Working… over a "run finished" transcript. The transcript is live here, so it
+  // arbitrates — a session end with no session after it refetches a record still claiming one.
+  useRunRecordReconcile(run.data, history.visibleEvents)
+
+  if (run.isPending) return <ThreadLoading />
+
+  if (run.isError) {
+    const notFound = run.error instanceof ApiError && run.error.status === 404
+    return (
+      <div data-route="task-thread" className="flex min-h-full flex-col">
+        <CenteredState
+          icon={notFound ? <SearchXIcon /> : <MessageSquareTextIcon />}
+          tone={notFound ? 'neutral' : 'danger'}
+          title={notFound ? 'Task not found' : 'Could not load this task'}
+          subtitle={
+            notFound
+              ? 'No run has this id. It may have been deleted, or the link is from another machine.'
+              : run.error.message
+          }
+          actions={
+            <Button asChild variant="outline">
+              <Link to="/tasks">Back to tasks</Link>
+            </Button>
+          }
+        />
+      </div>
+    )
+  }
+
+  if (history.isPending) return <ThreadLoading />
+
+  return (
+    <ThreadView
+      run={run.data}
+      thread={thread}
+      currentThread={currentThread}
+      history={history}
+      onMarkedUnread={suppressAutoReadFor}
+    />
+  )
+}
+
+/** The loaded thread. The header owns its own data hooks (mutations, the runs list); the
+ *  thread body stays presentational — tests drive it with reduced fixture states directly. */
+export function ThreadView({
+  run,
+  thread,
+  currentThread = thread,
+  history,
+  onMarkedUnread,
+  embedded = false,
+}: {
+  run: ApiRun
+  thread: ThreadState
+  currentThread?: ThreadState
+  history?: RunHistoryState
+  /** Passed straight through to the header's "Mark unread" (#775) so the route can suppress its
+   *  auto-mark-read effect. Optional: every test that drives this view with a fixture, and the
+   *  header's other three tabs, have no such effect to suppress. */
+  onMarkedUnread?: (runId: string) => void
+  /** A task-workspace column: the workspace draws the one run header above every column. */
+  embedded?: boolean
+}) {
+  const footer = threadFooter(run.status, run.error, isAwaitingAnswer(run), isIdleClosed(run), thread, { reason: run.cancelReason, by: run.cancelledBy })
+  const markedUnread = useCallback(() => onMarkedUnread?.(run.id), [onMarkedUnread, run.id])
+  // The dock's data: the latest plan snapshot across turns (full replacement — an emptied
+  // plan hides the dock and the header mirror alike).
+  const plan = latestPlanEntries(currentThread)
+  const budget = budgetStop(run)
+  const planTally = plan !== undefined && plan.length > 0 ? planCounts(plan) : undefined
+  // The Agents dock's data: the current fan-out's sub-agents, or [] when there is none to
+  // show (#474). Derived from the same reduced turns the thread renders — no new subscription.
+  // The legacy session-open rule (web/app.js `updateDetail`): the composer can deliver while
+  // the engine owns a live session — running queues the message, waiting answers it.
+  const sessionOpen = run.status === 'running' || run.status === 'waiting'
+  // …and the third state (#472): a queued run has not started, so its prompt is still
+  // authorable. "Session closed — Continue to reopen." was wrong on its own terms here —
+  // the session is not closed, it was never opened, and Continue means nothing for a run
+  // that has not run. Deliberately `queued` only: review/done/failed/cancelled keep the
+  // existing copy and their Continue action.
+  const queued = run.status === 'queued'
+  // …and the fourth: a closed run whose last session can be reopened. Continue used to be a
+  // bare button beside a DISABLED textarea, so "reopen it and say what to do next" meant
+  // continuing blind and then typing into the thread once the session came back. The composer
+  // stays authorable here instead: the draft is the prompt the reopened session starts on, and
+  // submitting an empty one is still the plain one-click Continue.
+  const continueAction = useContinueAction(run)
+  const hasContinuation = !sessionOpen && !queued && continueAction.available
+  const continuable = hasContinuation && continueAction.canContinue
+  const continueBlockedReason = continuable
+    ? undefined
+    : continueAction.providerPending
+      ? 'Checking the agent provider…'
+      : (continueAction.reason ?? 'Connect an agent provider to continue.')
+  // The footer's one-click Continue rides the same delivery seam as the composer's (deliver-prompt):
+  // its record can be just as stale, and a `run is still active` refusal means the run is already
+  // live — refetch and drop it, never the false failure a raw `continueWith` toasted (77117b95).
+  const deliverPrompt = useDeliverPrompt(run, continueAction.continueWith, { surface: null })
+  // A closed session can never settle its in-flight items — nothing in the reducer rewrites a
+  // `running` item on `session.ended`, so an interrupted fan-out stays `running` in the
+  // persisted stream forever. Without this, reopening it pulses `Agents · 0/1` above a dead
+  // transcript for good.
+  //
+  // Derived from `sessionOpen` rather than enumerated, so it cannot drift when a status is
+  // added: anything that is neither live nor still queued is closed. `review` matters most —
+  // it is where this pipeline's runs normally END, and `threadFooter` already calls it closed.
+  const lifecycleGate = !!run.worktreeLifecycle?.activeOperationId
+  const runIsTerminal = !sessionOpen && run.status !== 'queued'
+  const agents = useMemo(
+    () => collectSubagents(currentThread.turns, runIsTerminal),
+    [currentThread.turns, runIsTerminal],
+  )
+  // The Skills dock's data (#1202): the skills governing the run. Separate from `agents` on
+  // purpose — a skill used to be collected as a sub-agent, which reported a fan-out that never
+  // happened. Not scoped to the latest turn: a skill's instructions keep governing the run.
+  const skills = useMemo(() => collectSkills(currentThread.turns), [currentThread.turns])
+  // The drill-down's whole state: which agent is open. Ephemeral by design (spec Q2/Q5) —
+  // sub-agents have no stable identity outside their run, so there is nothing to persist.
+  const [openAgentId, setOpenAgentId] = useState<string | undefined>(undefined)
+  // Item ids repeat across runs (codex mints `item_1`, `item_rv_1` per session), so a
+  // selection carried across a route change could pop the sheet open on an unrelated item.
+  const [selectionRunId, setSelectionRunId] = useState(run.id)
+  if (selectionRunId !== run.id) {
+    setSelectionRunId(run.id)
+    setOpenAgentId(undefined)
+  }
+  // Resolved from the turns, NOT from `agents`: the dock can yield to the transcript (Q6)
+  // while a sheet is open, and that must not slam the panel shut mid-read.
+  const openAgent = useMemo(
+    () =>
+      openAgentId === undefined ?
+        undefined
+      : findSubagent(currentThread.turns, openAgentId, runIsTerminal),
+    [currentThread.turns, openAgentId, runIsTerminal],
+  )
+  const openAgentChildren = useMemo(
+    () => (openAgentId === undefined ? [] : subagentChildren(currentThread.turns, openAgentId)),
+    [currentThread.turns, openAgentId],
+  )
+  // The reply composer's unsent content (#939) — server-side, per run, restored on return.
+  const draft = useDraft(run.id, 'composer')
+  // Line comments left on the Changes tab — draft items that ride the next message (self-review).
+  const diffComments = useDiffComments(run.id)
+
+  // The queued-run affordances (#472), passed only while the run is queued — so the bubbles
+  // go read-only on the next `run` SSE frame once it starts. The bubbles await these promises
+  // so a failed write keeps its editor/draft open and shows the server's error.
+  // Depend on the `mutateAsync` functions, NOT the mutation result objects: TanStack returns a
+  // fresh result object every render, so memoizing on those would rebuild `edit` — and with it
+  // every thread row — on each render, defeating the memo that exists because these threads get
+  // big enough to virtualize. `mutateAsync` is referentially stable.
+  const { mutateAsync: patchRunAsync } = usePatchRun(run.id)
+  const { mutateAsync: editQueuedAsync } = useEditQueuedMessage(run.id)
+  const { mutateAsync: removeQueuedAsync } = useRemoveQueuedMessage(run.id)
+  const edit = useMemo(
+    () =>
+      queued ?
+        {
+          onEditTask: async (text: string) => { await patchRunAsync({ task: text }) },
+          onEditMessage: (msgId: string, text: string) =>
+            editQueuedAsync({ msgId, message: { text } }).then(() => undefined),
+          onRemoveMessage: (msgId: string) => removeQueuedAsync(msgId).then(() => undefined),
+        }
+      : undefined,
+    [queued, patchRunAsync, editQueuedAsync, removeQueuedAsync],
+  )
+
+  const sections = useMemo(() => mainTranscriptSections(run, thread), [run, thread])
+  const artifacts = useRunArtifacts(run.id).data?.artifacts
+  const rows = useMemo(
+    () => placeArtifactRows(buildTranscriptRows(sections, run.id), sections, artifacts ?? []),
+    [sections, run.id, artifacts],
+  )
+  const renderAsk = useCallback((ask: ThreadAsk) => <AskCard ask={ask} run={run} />, [run])
+  const messageActions = useMemo<Readonly<Record<string, TranscriptMessageActions>> | undefined>(() => {
+    if (edit === undefined) return undefined
+    const actions: Record<string, TranscriptMessageActions> = {
+      // `draftSurface` (#939) is what makes an unsaved edit survive leaving the task: the bubble
+      // writes it to the run's draft store and re-opens holding it on return.
+      task: { onEdit: edit.onEditTask, editLabel: 'Edit the prompt', draftSurface: 'task-prompt' },
+    }
+    for (const message of run.queuedMessages ?? []) {
+      actions[`queued:${message.id}`] = {
+        onEdit: (text) => edit.onEditMessage(message.id, text),
+        onRemove: () => edit.onRemoveMessage(message.id),
+        // Per message, so editing one and switching tasks restores THAT editor and leaves its
+        // neighbours closed and empty.
+        draftSurface: `message:${message.id}`,
+      }
+    }
+    return actions
+  }, [edit, run.queuedMessages])
+  // #526: the footer's issue link may be synthesized from the CEZ:ISSUE marker, and the only
+  // repository it may ever name is the one on screen — never the transcript's.
+  const issueUrl = taskIssueUrl(run, useProjectRepoBase())
+  const { search, hash } = useLocation()
+  // "Continue with a hint" and Now's Reply (`#reply`) both end in the composer: the next message
+  // is the hint. Reached by slot rather than a ref because the composer is the dock's.
+  const focusComposer = useCallback(() => {
+    document.querySelector<HTMLTextAreaElement>('[data-slot="composer"] textarea')?.focus()
+  }, [])
+  useEffect(() => {
+    if (hash === '#reply') focusComposer()
+  }, [hash, focusComposer, run.id])
+  const mode = threadRenderMode(search, rows.length)
+  // A wait can ask for a plain-text reply. Without an open question card to handle #ask,
+  // reveal the latest request instead of restoring an unrelated reading position.
+  const hasAskTarget = hash === '#ask' && sections.some((section) =>
+    section.entries.some((entry) => entry.kind === 'ask' && !entry.resolved),
+  )
+  const scroll = useThreadScroll(`${run.id}:main`, {
+    onLoadOlder: history?.hasOlder ? history.loadOlder : undefined,
+    onJumpToLatest: history?.jumpToLatest,
+    startAtLatest: hash === '#latest' || (hash === '#ask' && !hasAskTarget),
+    rowKeys: rows.map(({ key }) => key),
+  })
+  // "Your messages" (spec 2026-11-17-my-message-navigation): the jump pill grows into ▲ · 💬 · ▼.
+  const myMessages = useThreadMyMessages({ runId: run.id, sections, rowKeys: rows.map(({ key }) => key), history, scroll })
+  // The iOS keyboard lifts the dock via `--kb`; once it settles, a pinned reader re-pins
+  // (research §7: re-run scrollToEnd after the viewport settles).
+  useKeyboardInsetVar(scroll.restickIfStuck)
+
+  // "Use <other> instead" on a reconnect card: Continue on that account, a fresh session (spec
+  // 2026-11-18-inline-account-reconnect; 2026-07-29-agent-profiles § sessionId and profileId).
+  const continueOn = useContinueRun(run.id)
+  // The park is the source of truth: a rejection the runtime observer could not latch leaves no
+  // card in the transcript, so the dock carries it instead.
+  const parked = run.status === 'waiting' && run.parked?.kind === 'auth' ? run.parked : undefined
+  const reconnectSurface = useMemo<ReconnectSurface>(() => ({
+    kind: 'task',
+    ownId: run.id,
+    switchTo: (agentProfile: string) => continueOn.mutateAsync({ agentProfile }),
+    parked: parked ? { provider: parked.provider, profileId: parked.profileId } : null,
+  }), [continueOn.mutateAsync, run.id, parked?.provider, parked?.profileId])
+  const transcriptCard = useMemo(
+    () => parked !== undefined && thread.turns.some((turn) => turn.items.some((item) =>
+      item.kind === 'provider-auth-required' && item.state === undefined
+      && item.provider === parked.provider && (item.profileId ?? 'default') === parked.profileId)),
+    [thread.turns, parked],
+  )
+
+  return (
+    <ReconnectSurfaceContext.Provider value={reconnectSurface}>
+    <div data-route="task-thread" data-run-id={run.id} className="flex min-h-full flex-col">
+      {embedded ? null : <RunHeader run={run} planTally={planTally} onMarkedUnread={markedUnread} />}
+
+      {/* Row spacing lives on each thread row (pb-2.5, both render modes measure alike);
+          this gap only separates the sections — rows, empty state, footer, review panel. */}
+      <div className="mx-auto flex w-full max-w-[var(--measure)] flex-1 flex-col gap-2.5 px-3 py-3 md:gap-3.5 md:px-6 md:py-5">
+        {run.worktreeLifecycle ? <TaskLifecycleCard worktreeId={run.worktreeLifecycle.worktreeId} operationId={run.worktreeLifecycle.activeOperationId} worktreePath={run.worktreePath} taskTitle={run.title ?? run.task} /> : null}
+        {history ? (
+          <HistoryBoundary
+            hasOlder={history.hasOlder}
+            loading={history.isFetchingOlder}
+            error={history.olderError}
+            fallback={history.fallback}
+            fallbackTruncated={history.fallbackTruncated}
+            retainedPages={history.retainedPages}
+            onLoad={scroll.loadOlder}
+          />
+        ) : null}
+        <SessionTranscript
+          runId={run.id}
+          viewId="main"
+          sections={sections}
+          mode="document"
+          renderAsk={renderAsk}
+          messageActions={messageActions}
+          scrollControls={scroll}
+          renderMode={mode}
+          rowModels={rows}
+        />
+
+        {thread.turns.length === 0 ? (
+          run.status === 'queued' ? (
+            <QueuedPlaceholder run={run} />
+          ) : (
+            <p data-slot="thread-empty" className="py-6 text-center text-label text-soft-foreground">
+              No session events yet.
+            </p>
+          )
+        ) : null}
+
+        {/* Live session heartbeat: while the engine owns the turn (`running`), a spinner tails
+            the thread so quiet gaps between bursts don't read as "finished". `waiting` hands
+            off to the dock's reply hint, `queued` to the placeholder above — so `running` only. */}
+        {run.status === 'running' && !lifecycleGate ? (
+          <WorkingIndicator since={liveTurnStart(run, currentThread)} lastActivityAt={currentThread.lastEventAt} />
+        ) : null}
+
+        <E2eSetupVerdict run={run} />
+
+        {/* Closed states end the thread in the outcome card (spec: attention-first cockpit
+            (2026-11-11), Proposal 4) — except a session that closed on an open question, whose
+            ask card IS the decision; there the footer stays a plain line. The WAITING state
+            lives in the dock (mockup `.paused-hint`), right above the composer it is asking the
+            user to use. */}
+        {footer && footer.state === 'closed' ? (
+          isAwaitingAnswer(run) ? (
+            <div
+              data-slot="thread-footer"
+              data-state={footer.state}
+              className="mt-auto flex items-center gap-2 border-t border-border pt-3 text-label text-muted-foreground"
+            >
+              {/* Same Continue wiring as main: the label decides whether it shows (`FooterLabel`). */}
+              <FooterLabel
+                label={footer.label}
+                onContinue={hasContinuation ? () => deliverPrompt('', []) : undefined}
+                blockedReason={continueBlockedReason}
+              />
+              {isHttpUrl(taskPrUrl(run)) ? (
+                <a data-slot="pr-link" href={taskPrUrl(run)} target="_blank" rel="noopener noreferrer" className="font-medium text-foreground underline-offset-2 hover:underline">
+                  PR ↗
+                </a>
+              ) : null}
+              {isHttpUrl(issueUrl) ? (
+                <a data-slot="issue-link" href={issueUrl} target="_blank" rel="noopener noreferrer" className="font-medium text-foreground underline-offset-2 hover:underline">
+                  Issue ↗
+                </a>
+              ) : null}
+            </div>
+          ) : (
+            <OutcomeCard
+              run={run}
+              thread={thread}
+              footer={footer}
+              // A failure is always worth one click to retry, whatever its wording — unless it is
+              // already scheduled to resume itself (the AutoResumeHint says so in the dock).
+              offerContinue={footer.tone === 'danger' && !run.autoResumeAt}
+              // Offered whenever there is a session to reopen — not only once the provider check
+              // has passed: while it loads (or the provider is disconnected) the button is there,
+              // greyed, saying why, instead of the advice silently degrading to plain text.
+              onContinue={hasContinuation ? () => deliverPrompt('', []) : undefined}
+              blockedReason={continueBlockedReason}
+              onContinueWithHint={focusComposer}
+              issueUrl={issueUrl}
+            />
+          )
+        ) : null}
+
+        {/* The review gate (spec 009): a finished run with changes parks here — nothing
+            auto-merges. The panel exists exactly while the run rests at `review`. */}
+        {/* Send back carries the drafted line comments, like the composer does. An in-place task
+            (trunk-based, spec 2026-10-20-trunk-based-projects) gets no panel: corrections go through
+            the composer and landing through the header's Commit step. */}
+        {run.status === 'review' && !lifecycleGate && run.worktree !== false ? (
+          <ReviewPanel run={run} diffComments={diffComments} />
+        ) : null}
+      </div>
+
+      <AcceptCelebration status={run.status} />
+
+      {/* The drill-down for whichever Agents-dock row was clicked. Rendered outside the dock
+          so the sheet's portal is not affected by the dock's collapse state. SessionTranscript
+          owns the shared run-keyed card cache, so expanded sheet cards survive a reopen. */}
+      <SubagentSheet
+        runId={run.id}
+        renderAsk={renderAsk}
+        agent={openAgent}
+        entries={openAgentChildren}
+        onClose={() => setOpenAgentId(undefined)}
+      />
+
+      {/* The dock region (mockup `.dock`): plan dock, paused hint, then the composer.
+          `bottom: var(--kb)` is the iOS keyboard lift — 0 until the visualViewport watcher
+          publishes an inset. */}
+      <TaskDock
+        // The jump pill floats over the thread, just above the dock, centered.
+        overlay={
+          scroll.pillVisible ? (
+            <div className="pointer-events-none absolute inset-x-0 -top-12 flex justify-center">
+              {myMessages.items.length > 0
+                ? <MyMessagesPill nav={myMessages} onLatest={scroll.jumpToLatest} />
+                : <JumpToLatestPill onJump={scroll.jumpToLatest} />}
+            </div>
+          ) : null
+        }
+      >
+        {/* Agents above the plan: the fan-out is the more urgent "what is happening now",
+            and it is transient — the plan outlives it. Keyed by run id like the plan dock. */}
+        <AgentsDock key={`agents:${run.id}`} runId={run.id} agents={agents} onSelect={setOpenAgentId} />
+
+        {/* Below the agents: a skill is standing context for the whole run, not the volatile
+            "what is happening now" the fan-out reports (#1202). */}
+        <SkillsDock skills={skills} />
+
+        {plan !== undefined && plan.length > 0 ? (
+          // Keyed by run id: the collapse default re-derives per task (see PlanDock). Settled
+          // on the same rule as the Agents dock: a closed session never advances the plan.
+          <PlanDock key={run.id} runId={run.id} entries={plan} settled={runIsTerminal} />
+        ) : null}
+
+        {/* A usage-limit stop is the one `failed` state that is still going somewhere — the
+            dock says so before the composer offers a Continue nobody needs to press. */}
+        <AutoResumeHint run={run} />
+
+        {!lifecycleGate && budget ? (
+          <div data-slot="budget-hint" className={HINT_ROW}>
+            <StatusDot tone="pending" pulse />
+            <span className={HINT_TEXT}>
+              Budget reached — spent ${budget.spent.toFixed(2)} of ${budget.ceiling.toFixed(2)}; send a message to continue.
+            </span>
+            {run.status === 'waiting' ? (
+              <>
+                <span aria-hidden="true" className="max-sm:hidden">·</span>
+                <EndSessionButton runId={run.id} />
+              </>
+            ) : null}
+          </div>
+        ) : !lifecycleGate && parked !== undefined ? (
+          // Parked on an expired login (spec 2026-11-18-inline-account-reconnect).
+          transcriptCard ? (
+            <div data-slot="sign-in-hint" className={HINT_ROW}>
+              <StatusDot tone="pending" />
+              <span className={HINT_TEXT}>Reconnect the account above and the task continues where it stopped</span>
+            </div>
+          ) : (
+            <div data-slot="provider-auth-required" data-profile-id={parked.profileId}>
+              <ReconnectCard provider={parked.provider} profileId={parked.profileId} place="task" />
+            </div>
+          )
+        ) : !lifecycleGate && run.status === 'waiting' ? (
+          <div data-slot="paused-hint" className={HINT_ROW}>
+            <StatusDot tone="pending" pulse />
+            <span className={HINT_TEXT}>The agent is paused, waiting for your reply</span>
+            {/* The other answer to "your turn": not replying at all. It sits beside the hint
+                because that is the moment the choice is made — reply below, or end it here. */}
+            <span aria-hidden="true" className="max-sm:hidden">·</span>
+            <EndSessionButton runId={run.id} />
+          </div>
+        ) : null}
+
+        {queued ? (
+          <div
+            data-slot="queued-hint"
+            className="flex items-center gap-2 px-1 text-xs text-muted-foreground"
+          >
+            <StatusDot tone="pending" />
+            Messages you add now are folded into the prompt before the run starts.
+          </div>
+        ) : null}
+
+        {!lifecycleGate ? <TaskComposer
+          run={run}
+          draft={draft}
+          diffComments={diffComments}
+          continueAction={continueAction}
+          getMentionCandidates={() => threadFilePaths(thread)}
+        /> : <p className="px-1 text-xs text-muted-foreground">Resolve the worktree operation above before continuing this task.</p>}
+        {/* The gauges and the usage chip, bottom-right under the composer: here rather than in
+            the header so a folded header does not take them along. The chip's popover edits the
+            SAME continuation choice as the composer's pills — one hook owns both renderings, so a
+            pick here is exactly what the next submission sends. */}
+        {!lifecycleGate ? (
+          <div data-slot="session-usage" className="flex justify-end px-1">
+            <RunUsage
+              run={run}
+              continuationEngine={continuable ? continueAction.pills : undefined}
+              reportedModel={currentThread.sessionModel ?? thread.sessionModel}
+            />
+          </div>
+        ) : null}
+      </TaskDock>
+    </div>
+    </ReconnectSurfaceContext.Provider>
+  )
+}
+
+// On a phone the hint text wraps in its own column so End session stays one tappable line beside it.
+const HINT_ROW = 'flex items-center gap-2 px-1 text-xs text-muted-foreground'
+const HINT_TEXT = 'max-sm:min-w-0 max-sm:flex-1'
+
+/** Ends a waiting session (`POST /finish`): the run completes as done, or parks at review when
+ *  the worktree holds changes. A text button, like the footer's Continue — part of the hint line
+ *  it answers, not a toolbar control. */
+function EndSessionButton({ runId }: { runId: string }) {
+  const finish = useFinishRun(runId)
+  return (
+    <IconTooltip label="Closes the session — the task finishes, or goes to review if it changed files">
+      <button
+        type="button"
+        data-slot="end-session"
+        disabled={finish.isPending}
+        onClick={() => finish.mutate()}
+        className="shrink-0 rounded-sm font-medium whitespace-nowrap text-foreground underline-offset-2 hover:underline focus-visible:ring-[3px] focus-visible:ring-ring/50 focus-visible:outline-none disabled:opacity-60 pointer-coarse:max-md:min-h-11 pointer-coarse:max-md:px-2"
+      >
+        End session
+      </button>
+    </IconTooltip>
+  )
+}
+
+function HistoryBoundary({
+  hasOlder,
+  loading,
+  error,
+  fallback,
+  fallbackTruncated,
+  retainedPages,
+  onLoad,
+}: {
+  hasOlder: boolean
+  loading: boolean
+  error?: string
+  fallback: boolean
+  fallbackTruncated?: boolean
+  retainedPages: number
+  onLoad: () => void
+}) {
+  if (fallback) {
+    return (
+      <p data-slot="history-fallback" className="text-center text-label text-muted-foreground" role="status">
+        {error ?
+          'Progressive history is unavailable; earlier items could not be loaded.'
+        : loading ?
+          'Progressive history is unavailable; loading earlier items…'
+        : fallbackTruncated ?
+          'Progressive history is unavailable; showing only the most recent part of the session.'
+        : 'Progressive history is unavailable; showing the complete session.'}
+      </p>
+    )
+  }
+  if (!hasOlder && !error) {
+    return (
+      <div data-slot="history-start" className="flex items-center gap-3 text-meta text-soft-foreground">
+        <span aria-hidden className="h-px flex-1 bg-border" />
+        Start of session
+        <span aria-hidden className="h-px flex-1 bg-border" />
+      </div>
+    )
+  }
+  return (
+    <div
+      data-slot="history-boundary"
+      data-retained-pages={retainedPages}
+      aria-busy={loading}
+      className="flex min-h-8 items-center justify-center text-xs text-muted-foreground"
+    >
+      <button
+        type="button"
+        onClick={onLoad}
+        disabled={loading}
+        className="rounded-md px-3 py-1.5 font-medium hover:bg-muted disabled:cursor-wait"
+      >
+        {loading ?
+          'Loading 100 earlier items…'
+        : error ?
+          'Couldn’t load earlier items · Retry'
+        : 'Load 100 earlier items'}
+      </button>
+      <span className="sr-only" aria-live="polite">
+        {loading ? 'Loading earlier session history' : error ? error : ''}
+      </span>
+    </div>
+  )
+}
+
+/** Where the Working… counter starts: the open turn's start; between turns (a turn completed but
+ *  the run is still `running` — the next step spinning up), the moment that turn closed; with no
+ *  turn at all yet, the run's own start. */
+export function liveTurnStart(run: ApiRun, thread: ThreadState): string | undefined {
+  const last = thread.turns.at(-1)
+  if (last === undefined) return run.startedAt
+  if (last.completed === undefined) return last.startedAt ?? run.startedAt
+  return last.completed.ts ?? run.startedAt
+}
+
+/** The queued run's honest empty state (legacy #351): a queued run has emitted nothing, so
+ *  instead of a blank thread the placeholder names the parked state and its live position in
+ *  the FIFO queue (from the runs list — the same feed the sidebar uses). */
+function QueuedPlaceholder({ run }: { run: ApiRun }) {
+  const runs = useRuns()
+  const position = queuePosition(runs.data ?? [], run.id)
+  const startNow = useStartRunNow(run.id)
+  const promote = usePromoteRun(run.id)
+  return (
+    <div data-slot="queued-state" className="flex flex-col items-center gap-1.5 py-10 text-center">
+      <StatusDot tone="pending" pulse />
+      <p className="text-ui font-medium">
+        {queueWaitLabel(run.queueWaitReason) ?? `Waiting for a free agent slot${position !== undefined ? ` — #${position} in queue` : ''}`}
+      </p>
+      <p className="text-label text-muted-foreground">
+        {run.workflow} · {run.queueWaitReason ? 'starts automatically when the account and a slot are available' : 'starts automatically when a slot frees up'}
+      </p>
+      <div className="mt-2 flex flex-wrap items-center justify-center gap-2">
+        {/* A usage-limit hold still applies to a forced start, so the button would do nothing there. */}
+        {!run.queueWaitReason && (
+          <IconTooltip label="Start this task now, over the parallel-task limit">
+            <Button
+              data-slot="start-now"
+              size="sm"
+              variant="outline"
+              // Stays disabled after success until SSE flips the run off `queued` (a re-click would 409).
+              disabled={startNow.isPending || startNow.isSuccess}
+              onClick={() => startNow.mutate()}
+            >
+              Start now
+            </Button>
+          </IconTooltip>
+        )}
+        {/* "Run First" (brief 2026-09-23-queued-task-run-next) reorders the queue only, so it also
+            applies while an account hold keeps the run waiting. */}
+        {runActionFlags(run).promote && (
+          <IconTooltip label="Start this task in the next free slot, ahead of the rest of the queue">
+            <Button
+              data-slot="promote-run"
+              size="sm"
+              variant="outline"
+              disabled={promote.isPending}
+              onClick={() => promote.mutate()}
+            >
+              Run First
+            </Button>
+          </IconTooltip>
+        )}
+      </div>
+    </div>
+  )
+}

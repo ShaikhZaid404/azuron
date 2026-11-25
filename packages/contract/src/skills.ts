@@ -1,0 +1,116 @@
+import { z } from 'zod';
+import { reasoningEffortSchema } from './agent.ts';
+import { runnerSchema } from './health.ts';
+// `StartTodoResponse` embeds a whole run record, which belongs to the runs slice.
+import { runRecordSchema } from './runs.ts';
+
+// ---- skills (`GET /skills`, `POST /skills/refresh`) ---------------------------------------
+
+/**
+ * One discovered skill: repo (`.ai/skills`, `.ai/cezar/skills`), `npx skills` install dirs
+ * (project + global), a configured team skills repo (spec 005), or the one built-in.
+ */
+export const skillSchema = z.object({
+  name: z.string(),
+  description: z.string().optional(),
+  /** Advisory hint for untouched composer run-mode choices. */
+  interactive: z.literal(true).optional(),
+  body: z.string(),
+  path: z.string(),
+  /** `builtin`: a skill cezar ships itself, below every user location — `create-cezar-automation`
+   *  (only while automations are on and reachable, spec 2026-09-13-automations-from-prompt) and
+   *  the package's `skills/` directory (`change-impact`, spec 2026-10-22-html-artifacts-and-impact). */
+  source: z.enum(['ai', 'cezar', 'agents', 'global', 'team', 'builtin']),
+  /** A repo-local agent command (spec-kit's `.claude/commands/…`), not a skill: delivered inline only. */
+  kind: z.literal('command').optional(),
+  /** Commands only: every definition of this name, one per agent that ships it. */
+  variants: z.array(z.object({ runner: runnerSchema, path: z.string() })).optional(),
+  /** Team skills only: where the definition lives in its skills repo. */
+  team: z
+    .object({
+      repo: z.string(),
+      ref: z.string(),
+      path: z.string(),
+      /** True for the `SKILL.md` convention — a whole directory (references/…). */
+      dir: z.boolean(),
+      /**
+       * The exact commit `ref` resolved to when the skill was read (#428).
+       *
+       * The hand-written DTO omitted this field entirely — it was NARROWER than the route,
+       * which has served it since #428.
+       */
+      commit: z.string().optional(),
+    })
+    .optional(),
+  /** A repo-local extension (`.ai/skills/<name>/SKILL.md`) layered on this shared skill: the
+   *  entry IS the shared skill, the extension is applied on top of it. */
+  extension: z.object({ path: z.string() }).optional(),
+  /** This entry is a repo extension whose shared skill cezar could not load: running it alone
+   *  would only half-run the skill, so the cockpit offers "Install skills". */
+  missingShared: z.literal(true).optional(),
+});
+export type Skill = z.infer<typeof skillSchema>;
+
+/**
+ * A skill offered by the default (vendor) repo, from `GET /skills/importable`, independent of
+ * whether it is enabled. The full definition lets the Skills catalog preview it before enabling.
+ */
+export const importableSkillSchema = skillSchema;
+export type ImportableSkill = z.infer<typeof importableSkillSchema>;
+
+// ---- follow-up inbox / todos (spec 007) ---------------------------------------------------
+
+/** One entry of `.ai/cezar/todos.json`, as `GET /todos` serves it (ids are backfilled on read). */
+export const todoItemSchema = z.object({
+  id: z.string(),
+  ts: z.string().optional(),
+  taskId: z.string().optional(),
+  summary: z.string().min(1),
+  action: z.string().optional(),
+  prUrl: z.string().optional(),
+  suggestedSkill: z.string().optional(),
+  suggestedArgs: z.string().optional(),
+  suggestedPrompt: z.string().optional(),
+  /** Explicit intent; missing infers from suggestedSkill/suggestedPrompt for old files. */
+  runnable: z.boolean().optional(),
+  /** Set once a task was started from this entry — it then leaves the inbox and stays as
+   *  the audit trail. A later launch never overwrites the first. */
+  startedTaskId: z.string().optional(),
+});
+export type TodoItem = z.infer<typeof todoItemSchema>;
+
+/**
+ * `DELETE /todos/:id` — Dismiss checks the entry off.
+ *
+ * `removed` is the LITERAL `true`: a miss is a 404 `{ error }`, never `{ removed: false }`.
+ * The hand-written DTO said `boolean`, which was wider than the route.
+ */
+export const removeTodoResponseSchema = z.object({
+  removed: z.literal(true),
+});
+export type RemoveTodoResponse = z.infer<typeof removeTodoResponseSchema>;
+
+/** `POST /todos/:id/start` — 201 with the run the entry became. */
+export const startTodoResponseSchema = z.object({
+  run: runRecordSchema,
+});
+export type StartTodoResponse = z.infer<typeof startTodoResponseSchema>;
+
+/**
+ * `POST /todos/:id/start`. No body keeps the historic host-default behavior; a supplied
+ * reasoning effort is a per-run selection for the agent the todo starts.
+ */
+export const startTodoInputSchema = z
+  .object({
+    runner: runnerSchema.optional(),
+    model: z.string().max(200).optional(),
+    reasoningEffort: reasoningEffortSchema.optional(),
+    prompt: z
+      .string()
+      .trim()
+      .max(20_000, 'must be at most 20000 characters')
+      .optional()
+      .transform((s) => (s ? s : undefined)),
+  })
+  .optional();
+export type StartTodoInput = z.input<typeof startTodoInputSchema>;

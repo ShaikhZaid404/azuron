@@ -1,0 +1,210 @@
+import { ChevronRightIcon, FileIcon, FolderIcon, ImageIcon } from 'lucide-react'
+import { useState } from 'react'
+
+import { useRunFile } from '@/api/queries'
+import { cn } from '@/lib/utils'
+import { LoadingState, TreeSkeleton } from '@/components/loading-state'
+
+import { isJunkPath, partitionJunk } from './file-tree'
+import { JunkFold } from './junk-fold'
+import { formatFileSize, isImagePath } from './worktree-files'
+
+/**
+ * The Files tab's worktree tree (R5 Step 1.6) — the lazy sibling of ChangesTree. The Changes
+ * tree draws a payload it already has; here every directory is its own `GET /files?path=`
+ * listing, fetched the first time the folder opens (react-query caches per path, so
+ * re-opening is free). Folders therefore start CLOSED — an open-by-default tree would fan
+ * out into one request per directory and defeat the lazy contract.
+ */
+export function FilesTree({
+  runId,
+  selected,
+  onSelect,
+}: {
+  runId: string
+  selected: string | null
+  onSelect: (path: string) => void
+}) {
+  return (
+    <nav data-slot="files-tree" aria-label="Worktree files" className="min-w-0 text-ui">
+      <ul className="flex flex-col gap-px">
+        <DirChildren runId={runId} path="" depth={0} selected={selected} onSelect={onSelect} />
+      </ul>
+    </nav>
+  )
+}
+
+/** One directory's rows — mounts (and thereby fetches) only while its parent is open. */
+function DirChildren({
+  runId,
+  path,
+  depth,
+  selected,
+  onSelect,
+}: {
+  runId: string
+  path: string
+  depth: number
+  selected: string | null
+  onSelect: (path: string) => void
+}) {
+  const entry = useRunFile(runId, path)
+
+  if (entry.isPending) {
+    return (
+      <LoadingState as="li" label="Loading folder…" data-slot="files-tree-loading">
+        <TreeSkeleton rows={2} indent={24 + depth * 14} />
+      </LoadingState>
+    )
+  }
+  if (entry.isError) {
+    return (
+      <li data-slot="files-tree-error" className="px-1.5 py-1 text-label text-danger" style={{ paddingLeft: `${24 + depth * 14}px` }}>
+        {entry.error.message}
+      </li>
+    )
+  }
+  if (entry.data.type !== 'dir') return null
+  if (entry.data.entries.length === 0) {
+    return (
+      <li data-slot="files-tree-empty" className="px-1.5 py-1 text-label text-muted-foreground" style={{ paddingLeft: `${24 + depth * 14}px` }}>
+        Empty directory
+      </li>
+    )
+  }
+
+  // The server already sorts dirs-first, name-ascending; only the junk moves — after the source
+  // files, muted, folded when there are many (`isJunkPath`).
+  const childPath = (name: string) => (path === '' ? name : `${path}/${name}`)
+  const dirs = entry.data.entries.filter((child) => child.type === 'dir')
+  const { source, junk } = partitionJunk(
+    entry.data.entries.filter((child) => child.type === 'file'),
+    (child) => isJunkPath(child.name),
+  )
+  const fileNode = (child: { name: string; size?: number }, isJunk: boolean) => (
+    <FileNode
+      key={child.name}
+      name={child.name}
+      path={childPath(child.name)}
+      size={child.size}
+      depth={depth}
+      junk={isJunk}
+      selected={selected}
+      onSelect={onSelect}
+    />
+  )
+  return (
+    <>
+      {dirs.map((child) => (
+        <DirNode
+          key={child.name}
+          runId={runId}
+          name={child.name}
+          path={childPath(child.name)}
+          depth={depth}
+          selected={selected}
+          onSelect={onSelect}
+        />
+      ))}
+      {source.map((child) => fileNode(child, false))}
+      <JunkFold count={junk.length} depth={depth} forceOpen={junk.some((child) => childPath(child.name) === selected)}>
+        {junk.map((child) => fileNode(child, true))}
+      </JunkFold>
+    </>
+  )
+}
+
+function DirNode({
+  runId,
+  name,
+  path,
+  depth,
+  selected,
+  onSelect,
+}: {
+  runId: string
+  name: string
+  path: string
+  depth: number
+  selected: string | null
+  onSelect: (path: string) => void
+}) {
+  const [open, setOpen] = useState(false)
+  return (
+    <li>
+      <button
+        type="button"
+        data-slot="files-dir"
+        data-path={path}
+        data-state={open ? 'open' : 'closed'}
+        aria-expanded={open}
+        onClick={() => setOpen((value) => !value)}
+        className="flex w-full min-w-0 items-center gap-1.5 rounded-sm px-1.5 py-1 text-left text-muted-foreground hover:bg-muted hover:text-foreground"
+        style={{ paddingLeft: `${6 + depth * 14}px` }}
+      >
+        <ChevronRightIcon
+          aria-hidden="true"
+          className={cn('size-3.5 shrink-0 transition-transform', open && 'rotate-90')}
+        />
+        <FolderIcon aria-hidden="true" className="size-3.5 shrink-0" />
+        <span className="min-w-0 truncate font-medium">{name}</span>
+      </button>
+      {open ? (
+        <ul className="flex flex-col gap-px">
+          <DirChildren runId={runId} path={path} depth={depth + 1} selected={selected} onSelect={onSelect} />
+        </ul>
+      ) : null}
+    </li>
+  )
+}
+
+function FileNode({
+  name,
+  path,
+  size,
+  depth,
+  junk = false,
+  selected,
+  onSelect,
+}: {
+  name: string
+  path: string
+  size: number | undefined
+  depth: number
+  /** De-emphasised: an image, a binary, OS cruft — listed, but in the tertiary ink. */
+  junk?: boolean
+  selected: string | null
+  onSelect: (path: string) => void
+}) {
+  const active = selected === path
+  const Icon = isImagePath(path) ? ImageIcon : FileIcon
+  return (
+    <li>
+      <button
+        type="button"
+        data-slot="files-file"
+        data-path={path}
+        data-junk={junk ? 'true' : undefined}
+        aria-current={active ? 'true' : undefined}
+        onClick={() => onSelect(path)}
+        className={cn(
+          'flex w-full min-w-0 items-center gap-1.5 rounded-sm px-1.5 py-1 text-left hover:bg-muted',
+          active
+            ? 'bg-muted font-medium text-foreground'
+            : junk
+              ? 'text-soft-foreground hover:text-muted-foreground'
+              : 'text-muted-foreground hover:text-foreground',
+        )}
+        style={{ paddingLeft: `${24 + depth * 14}px` }}
+      >
+        <Icon aria-hidden="true" className="size-3.5 shrink-0" />
+        <span className="min-w-0 truncate">{name}</span>
+        {size !== undefined ? (
+          <span className="ml-auto shrink-0 pl-2 font-mono text-meta tabular-nums text-soft-foreground">
+            {formatFileSize(size)}
+          </span>
+        ) : null}
+      </button>
+    </li>
+  )
+}

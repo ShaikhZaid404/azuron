@@ -1,0 +1,140 @@
+import { accessSync, constants, existsSync, mkdtempSync, realpathSync, rmSync } from 'node:fs'
+import { homedir, tmpdir } from 'node:os'
+import { dirname, join } from 'node:path'
+import { afterAll, afterEach, beforeEach } from 'vitest'
+import { RUN_SCOPED_ENV } from './src/workflows/run-env-keys.ts'
+
+// Inside a cezar task TMP is `<repo>/.ai/cezar/tmp/<run>` — the user's own checkout. Cases that
+// take a fresh `tmpdir()` folder for "outside any repo" then ran git there: `commitAll` committed
+// the user's dirty files and a landing path pushed HEAD to their remote. So before anything else
+// takes a temp dir, move TMP/TEMP/TMPDIR to a system temp that no git work tree contains.
+function isWritable(dir: string): boolean {
+  try {
+    accessSync(dir, constants.W_OK)
+    return true
+  } catch {
+    return false
+  }
+}
+
+function insideGitWorkTree(dir: string): boolean {
+  for (let d = dir; ; d = dirname(d)) {
+    if (existsSync(join(d, '.git'))) return true
+    if (dirname(d) === d) return false
+  }
+}
+
+// A cezar agent's TMP can also sit under the real `~/.cezar` (`tmp/agent/…`): sandbox homes made
+// there trip `assertCezarHomeWriteIsSandboxed` on every write, so that TMP moves out the same way.
+function insideRealCezarHome(dir: string): boolean {
+  const realHome = join(homedir(), '.cezar')
+  const home = existsSync(realHome) ? realpathSync(realHome) : realHome
+  return dir === home || dir.startsWith(home + '/') || dir.startsWith(home + '\\')
+}
+
+if (insideGitWorkTree(realpathSync(tmpdir())) || insideRealCezarHome(realpathSync(tmpdir()))) {
+  const candidates =
+    process.platform === 'win32'
+      ? [join(process.env.LOCALAPPDATA || join(homedir(), 'AppData', 'Local'), 'Temp'), join(process.env.SystemRoot || 'C:\\Windows', 'Temp')]
+      : ['/tmp', '/var/tmp']
+  const outside = candidates.find((dir) => existsSync(dir) && isWritable(dir) && !insideGitWorkTree(realpathSync(dir)) && !insideRealCezarHome(realpathSync(dir)))
+  if (!outside) {
+    throw new Error(`[cez] tmpdir ${tmpdir()} is inside a git work tree or ~/.cezar and no system temp outside them exists — refusing to run git fixtures in it`)
+  }
+  process.env.TMPDIR = process.env.TMP = process.env.TEMP = outside
+}
+
+// Node resolves macOS's /tmp and /var aliases in cwd; metadata and storage fixtures must agree.
+process.env.TMPDIR = process.env.TMP = process.env.TEMP = realpathSync(tmpdir())
+
+// Nothing in this suite may write to the developer's own `~/.cezar`. Most cases pin
+// `CEZ_HOME` themselves, but the pin is one global for the whole worker and their
+// `afterEach` deletes it — so a write that outlives its test (a timeout is enough)
+// used to resolve the real home and replace the project registry with the fixture's.
+//
+// This file removes the unpinned state entirely: every worker gets a sandbox home,
+// and the pin is restored around every test, so a case that drops it can only leave
+// the NEXT write pointed at the sandbox. A test that wants the unpinned default
+// deletes the variable inside its own body (see `src/paths.test.ts`) — that still
+// works, because this hook runs after the test, not during it. The write guard in
+// `assertCezarHomeWriteIsSandboxed` catches whatever still slips through.
+// Fixture repos commit constantly; a developer's global `commit.gpgsign=true` turns each
+// commit into a gpg round-trip (~0.35s) and pushes git-heavy cases past the 5s timeout
+// under parallel load. Signing is irrelevant to every fixture, so switch it off here —
+// injected through git's env config, so no global or repo config file is touched.
+if (!process.env.GIT_CONFIG_COUNT) {
+  process.env.GIT_CONFIG_COUNT = '1'
+  process.env.GIT_CONFIG_KEY_0 = 'commit.gpgsign'
+  process.env.GIT_CONFIG_VALUE_0 = 'false'
+}
+
+// Fixtures under `tmpdir()` that are deliberately NOT repositories must stay that way when the
+// temp dir itself sits inside a checkout — a cezar task points TMPDIR into the repo's
+// `.ai/cezar/tmp/`, and git would otherwise discover the cezar repo above every fixture.
+process.env.GIT_CEILING_DIRECTORIES = [
+  ...new Set([tmpdir(), realpathSync(tmpdir())]),
+  ...(process.env.GIT_CEILING_DIRECTORIES ? [process.env.GIT_CEILING_DIRECTORIES] : []),
+].join(':')
+
+// A cockpit's per-run variables (`src/workflows/run-env-keys.ts`). Run inside a cezar task, the
+// suite would inherit them, so a case's env would depend on where it ran — and a spawned mock
+// would write into the outer run. A case that needs one sets it itself.
+for (const name of RUN_SCOPED_ENV) delete process.env[name]
+
+// Desktop identity and its macOS trampoline must not change telemetry or clone synthetic CLIs.
+// Launcher tests opt in explicitly with their own environment and executable fixtures.
+delete process.env.CEZ_DESKTOP
+delete process.env.CEZ_DISCLAIM_EXEC
+
+// `gh`'s signed-in hosts decide which remotes count as GitHub Enterprise (`src/github-hosts.ts`);
+// a developer's own `hosts.yml` must not change what the suite classifies. A case that wants
+// a host sets `GH_CONFIG_DIR` itself.
+process.env.GH_CONFIG_DIR = mkdtempSync(join(tmpdir(), 'cez-gh-config-'))
+delete process.env.GH_HOST
+
+// LLM task naming is on by default (`autoNamingActive`), so any case that starts a run on
+// a real backend spawned `claude -p "[cez-namer] Name this task."` on the developer's own
+// subscription — the same canned tasks, every run. Off for the whole suite; a test that
+// exercises the namer sets `CEZ_AUTONAME=1` itself (against mock-claude). Forced at load so
+// a shell's own value cannot leak in, and re-pinned around every case like `CEZ_HOME`, so a
+// case that deletes it cannot hand the next case the default-on namer.
+process.env.CEZ_AUTONAME = '0'
+
+const pinAutonameOff = (): void => {
+  if (process.env.CEZ_AUTONAME === undefined) process.env.CEZ_AUTONAME = '0'
+}
+
+beforeEach(pinAutonameOff)
+afterEach(pinAutonameOff)
+
+// mock-claude's demo pacing was most of the suite's wall clock in CI. A case that needs a
+// turn held open says `mock:pause`/`mock:slow`, which never scale.
+if (process.env.CEZ_MOCK_PACE === undefined) process.env.CEZ_MOCK_PACE = '0'
+
+const sandboxHome = mkdtempSync(join(realpathSync(tmpdir()), 'cez-vitest-home-'))
+
+const pinSandboxHome = (): void => {
+  if (!process.env.CEZ_HOME) process.env.CEZ_HOME = sandboxHome
+}
+
+pinSandboxHome()
+beforeEach(pinSandboxHome)
+
+// Gemini CLI has no `auth status`: cezar reads its credentials from the environment and from
+// `<GEMINI_CLI_HOME or ~>/.gemini/.env` (`src/core/gemini-credentials.ts`). Pin that home to the
+// sandbox and drop the host's Gemini credentials, so no case depends on whether the developer
+// running the suite has a Gemini key. A test that wants one sets it in its own body. The one
+// exception is the opt-in real-CLI smoke (`CEZ_GEMINI_SMOKE=1`, `gemini-acp-runner.smoke.test.ts`),
+// which needs the real CLI to find the operator's own credentials.
+if (process.env.CEZ_GEMINI_SMOKE !== '1') {
+  process.env.GEMINI_CLI_HOME = sandboxHome
+  for (const name of ['GEMINI_API_KEY', 'GOOGLE_API_KEY', 'GOOGLE_GEMINI_BASE_URL', 'GOOGLE_GENAI_USE_VERTEXAI', 'GOOGLE_GENAI_USE_GCA']) {
+    delete process.env[name]
+  }
+}
+// Registered before any suite's own hooks, so vitest runs it last on the way out —
+// after a case's `afterEach` has deleted the pin.
+afterEach(pinSandboxHome)
+afterAll(() => {
+  rmSync(sandboxHome, { recursive: true, force: true })
+})

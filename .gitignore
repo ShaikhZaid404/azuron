@@ -1,30 +1,26 @@
-# Dependencies
 node_modules/
+dist/
+packages/*/dist/
+packages/cezar/web/dist/
+*.tsbuildinfo
+.idea
+.vscode/
 
-# Build output
-packages/contract/dist/
-packages/server/dist/
-packages/web/dist/
+# Build artifact
+/packages/cezar/README.md
 
-# AZURON runtime data (never commit)
+# AZURON runtime state
 .azuron/
 *.pid
 *.log
 *.key
 
-# Environment
+# Local skills / temp
+.ai/
+.agents/
+skills-lock.json
+.claude/
 .env
 .env.local
-
-# OS
 .DS_Store
 Thumbs.db
-
-# Editor
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# Test artifacts
-packages/server/test/fixtures/
