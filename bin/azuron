@@ -42,11 +42,6 @@ async function cmdStart() {
     console.log(`[INFO] AZURON ${VERSION} is already running (PID ${existing}) at ${URL}`);
     return;
   }
-  if (await isPortInUse()) {
-    console.log(`[INFO] AZURON ${VERSION} is already running at ${URL} (port ${PORT} active).`);
-    console.log('[INFO] Use "azuron restart" to restart or "azuron status" to inspect.');
-    return;
-  }
   const entry = fs.existsSync(serverEntry) ? serverEntry : serverTsEntry;
   const args = ['--max-old-space-size=256'];
   if (entry.endsWith('.ts')) args.push('--experimental-strip-types');
