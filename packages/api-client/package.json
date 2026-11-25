@@ -1,7 +1,8 @@
 {
   "name": "@open-mercato/cezar-api-client",
   "version": "0.21.0",
-  "description": "Typed client and shared contract types for the cezar cockpit HTTP API.",
+  "description": "Typed client and shared contract types for the AZURON cockpit HTTP API.",
+  "author": "ShaikhZaid404",
   "license": "MIT",
   "private": true,
   "type": "module",
@@ -30,8 +31,8 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/open-mercato/cezar",
-    "directory": "web/api-client"
+    "url": "https://github.com/ShaikhZaid404/azuron",
+    "directory": "packages/api-client"
   },
   "publishConfig": {
     "access": "public"

@@ -12,7 +12,7 @@
  * Everyone else is a person at a shell, and for them "only works inside a task" was false — the
  * CLIs work from any shell given the address, so that is what they are told.
  */
-export const DEFAULT_COCKPIT_URL = 'http://127.0.0.1:4321';
+export const DEFAULT_COCKPIT_URL = 'http://127.0.0.1:45160';
 
 /**
  * The page `serve` opens in the browser: the folder it was started in, via the `default` alias.
@@ -37,7 +37,7 @@ export function missingCockpitMessage(message: MissingCockpitMessage, env: { CEZ
     `${message.command}: CEZ_API_URL is not set, so there is no cockpit to talk to.`,
     `Point it at a running cockpit — the address it printed after "cockpit →" when it started (${DEFAULT_COCKPIT_URL} by default):`,
     `  CEZ_API_URL=${DEFAULT_COCKPIT_URL} ${message.example}`,
-    'On a cockpit serving several projects, add CEZ_PROJECT_ID=<id> (`cezar projects` lists them); without it the command addresses the project the cockpit was started in.',
-    'Inside a cezar task the cockpit sets this variable itself — if it is missing there, the feature is off: do not set it by hand.',
+    'On a cockpit serving several projects, add CEZ_PROJECT_ID=<id> (`azuron projects` lists them); without it the command addresses the project the cockpit was started in.',
+    'Inside an AZURON task the cockpit sets this variable itself — if it is missing there, the feature is off: do not set it by hand.',
   ].join('\n');
 }

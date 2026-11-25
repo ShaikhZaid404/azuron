@@ -82,47 +82,28 @@ import {
 } from './runtime/cockpit-runtime.ts';
 import { handoffMarkerLine, handoffProject } from './runtime/cockpit-handoff.ts';
 
-const HELP = `cezar — local cockpit for AI agent tasks in your repo
+const HELP = `azuron — local cockpit for AI agent tasks in your repo
 
 Usage:
-  cezar                     start the cockpit (server + GUI) for the current repo
-  cezar run "<task>"        run a task headless in the terminal
-  cezar task <create|report|list>  dispatch or report from inside a running task (CEZ_DISPATCH=0 turns it off)
-  cezar automation <add|create|check|run|list|…>  create and manage automations (GitHub polls, schedules) on a running cockpit
-  cezar manager <status|tasks|merge|…>  the tools a manager's agent calls on a running cockpit (needs CEZ_MANAGER_ID)
-  cezar handoff <log|resume>  update a running task's handoff file (CEZ_HANDOFF_FILE)
-  cezar runs list           list a running cockpit's tasks from a shell (CEZ_API_URL=http://127.0.0.1:4321)
-  cezar worktrees <list|reclaim|prune|remove>  task worktrees on disk: sizes, reclaim idle ones
-                            (reclaim [--older-than 7d] [--all-inactive] [--dry-run] · remove <runId> ·
-                            prune [--archived-older-than 90d] [--dry-run]);
-                            uses the running cockpit when one serves the project, else the repo directly
-  cezar usage [--json]      which tasks and managers used your Claude/Codex plan limits (\`cezar usage --help\`)
-  cezar impact <evidence|render>  collect evidence for, and render, an impact report
-                            (local, no cockpit; paths default to $CEZ_ARTIFACTS_DIR)
-  cezar init                scaffold .ai/cezar/ (example workflow + skill)
-  cezar projects            list the projects this cockpit serves
-                            (also: projects add [<dir>] · projects remove <id>)
-  cezar tracker-connections <list|remove ID>  inspect or delete local project credentials
-  cezar secrets <list|set NAME|unset NAME>  this project's secrets (--workspace: the user's)
-                            (set reads the value from stdin; agents never receive them)
-  cezar telemetry [status|enable|disable|inspect]  opt-in usage data (off until you enable it)
-  cezar server-install      interactive wizard to host cezar on a server
-  cezar server-deploy       redeploy a new version (reload the service) + verify
-  cezar server-uninstall    reverse a server-install
-  cezar install             install THIS cezar permanently under ~/.cezar (a \`cezar\`
-                            command on PATH that updates itself from the cockpit)
-  cezar update              update the managed install to the channel's newest version
-                            (--channel stable|nightly, --version <x> to pin or downgrade)
-  cezar versions            list installed versions and cezar worktrees (\`cezar use <id>\` switches)
-  cezar versions prune      remove old versions, keeping the running one + 2 previous
-                            (--keep <n>, --dry-run, --backups for ~/.cezar/versions.backup-*)
-  cezar link [<dir>]        run a cezar checkout/worktree (default: cwd) as a version — a
-                            link, not a copy, so rebuilds are live (--use to switch to it now);
-                            the desktop app runs it after a restart or from Cezar ▸ Versions
-  cezar unlink <id>         forget a linked checkout (the checkout itself is untouched)
+  azuron                     start the cockpit (server + GUI) for the current repo
+  azuron run "<task>"        run a task headless in the terminal
+  azuron task <create|report|list>  dispatch or report from inside a running task
+  azuron automation <add|create|check|run|list|…>  create and manage automations (GitHub polls, schedules)
+  azuron manager <status|tasks|merge|…>  manager agent tools on running cockpit
+  azuron handoff <log|resume>  update a running task's handoff file
+  azuron runs list           list a running cockpit's tasks from a shell
+  azuron worktrees <list|reclaim|prune|remove>  manage task worktrees on disk
+  azuron usage [--json]      plan limits usage overview
+  azuron impact <evidence|render>  collect and render impact report
+  azuron init                scaffold workflows and skills
+  azuron projects            list or manage served projects
+  azuron secrets <list|set NAME|unset NAME>  project and workspace secrets
+  azuron telemetry [status|enable|disable|inspect]  opt-in usage data
+  azuron update              update AZURON to the newest version
+  azuron doctor              diagnose environment, node, and clis
 
 Options:
-  -p, --port <n>              cockpit port (default 4321; server-install: this
+  -p, --port <n>              cockpit port (default 45160; server-install: this
                               instance's loopback port — auto-picked per domain)
       --repo <dir>            repo to operate on (default: cwd)
       --workflow <name>       workflow for \`run\` (default: quick-task)
@@ -140,16 +121,15 @@ Options:
       --bind-host <host>      host the cockpit binds (default 127.0.0.1). Use with
                               --external-proxy when the proxy runs in a container and
                               cannot reach loopback (e.g. docker bridge 172.17.0.1).
-                              cezar has NO built-in auth — never expose this publicly.
+                              azuron has NO built-in auth — never expose this publicly.
       --yes                   server-install: accept safe defaults (never auto-sudo)
       --reconfigure <ids>     server-install: force re-run of step id(s), comma-separated
       --reinstall             server-install: force re-run of every step (full reinstall)
   -h, --help                  show this help
 
-Zero config: uses your logged-in \`claude\` CLI (and \`gh\` for GitHub bits).
-Skills live in .ai/skills/, .ai/cezar/skills/ and your team skills repo
-(default open-mercato/skills; override via .ai/cezar/config.json);
-workflows in .ai/cezar/workflows/.`;
+Zero config: uses your logged-in \`antigravity\` (agy) or \`codex\` CLI.
+Skills live in .ai/skills/, .ai/azuron/skills/ (or .ai/cezar/skills/) and your team skills repo;
+workflows in .ai/azuron/workflows/ (or .ai/cezar/workflows/).`;
 
 async function main(): Promise<void> {
   if (process.argv[2] === 'tracker') {
@@ -557,8 +537,8 @@ async function serveCommand(
   void selfUpdate.updateAvailable().then((latest) => {
     if (!latest) return;
     update.latest = latest;
-    const how = selfUpdate.installKind === 'managed' ? 'update from the cockpit or: cezar update' : `restart with: npx ${pkgName}@latest`;
-    console.log(`\n  ⬆ cezar ${latest} is available (running ${version}) — ${how}\n`);
+    const how = selfUpdate.installKind === 'managed' ? 'update from the cockpit or: azuron update' : `restart with: npx ${pkgName}@latest`;
+    console.log(`\n  ⬆ azuron ${latest} is available (running ${version}) — ${how}\n`);
   });
   // What the process is doing, on every error report (a wide event, not a bare message).
   registerTelemetryContext(() => {
@@ -580,7 +560,7 @@ async function serveCommand(
   // auth (see `server-install --external-proxy`). Say so, loudly, every start.
   if (bindHost && !['127.0.0.1', 'localhost', '::1'].includes(bindHost)) {
     console.log(
-      `\n  ⚠ binding ${bindHost}:${port} — cezar has no built-in auth.\n` +
+      `\n  ⚠ binding ${bindHost}:${port} — azuron has no built-in auth.\n` +
         `    Only do this behind a reverse proxy that enforces authentication,\n` +
         `    and make sure this interface is not reachable from the internet.\n`,
     );
@@ -629,7 +609,7 @@ async function serveCommand(
     ? `${url}/p/${encodeURIComponent(bootProjectId)}/`
     : launchPageUrl(url);
 
-  console.log(`\n  cezar v${version} — ${repoRoot}`);
+  console.log(`\n  AZURON v${version} — ${repoRoot}`);
   console.log(`  ${repo ? `branch ${repo.branch}` : 'not a git repository (tasks run in place, one at a time; repo view is empty)'}`);
   for (const check of checks) {
     const mark = check.available ? '✓' : '✗';
@@ -1042,9 +1022,9 @@ function readOwnName(): string {
   try {
     const here = dirname(fileURLToPath(import.meta.url));
     const pkg = JSON.parse(readFileSync(join(here, '..', 'package.json'), 'utf8')) as { name?: string };
-    return pkg.name ?? '@open-mercato/cezar';
+    return pkg.name ?? 'azuron';
   } catch {
-    return '@open-mercato/cezar';
+    return 'azuron';
   }
 }
 

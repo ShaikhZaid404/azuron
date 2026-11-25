@@ -72,10 +72,10 @@
           var mobile = /CezarMobile\//.test(navigator.userAgent)
           root.innerHTML =
             '<div role="alert" style="min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;padding:24px;text-align:center;font:15px/1.4 system-ui,sans-serif;color:#e5e5e5;background:#0d0d0d">' +
-            '<strong style="font-size:18px">cezar could not start</strong>' +
-            '<span style="opacity:.8">Its files did not load. cezar may have just been updated or restarted.</span>' +
+            '<strong style="font-size:18px">AZURON could not start</strong>' +
+            '<span style="opacity:.8">Its files did not load. AZURON may have just been updated or restarted.</span>' +
             '<button type="button" id="cez-boot-reload" style="font:inherit;padding:10px 20px;border-radius:10px;border:0;background:#fff;color:#000">Reload</button>' +
-            (mobile ? '<a href="cezar://servers" style="color:#e5e5e5">Your cezars</a>' : '') +
+            (mobile ? '<a href="cezar://servers" style="color:#e5e5e5">Your AZURON instances</a>' : '') +
             '</div>'
           document.getElementById('cez-boot-reload').onclick = function () {
             location.reload()

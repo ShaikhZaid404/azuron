@@ -38,8 +38,8 @@ function run(id: string, status: RunRecord['status']): RunRecord {
     steps: [],
   }
 }
-const AVAILABLE: StarCountPayload = { available: true, count: 1234, url: 'https://github.com/open-mercato/cezar' }
-const UNAVAILABLE: StarCountPayload = { available: false, url: 'https://github.com/open-mercato/cezar' }
+const AVAILABLE: StarCountPayload = { available: true, count: 1234, url: 'https://github.com/ShaikhZaid404/azuron' }
+const UNAVAILABLE: StarCountPayload = { available: false, url: 'https://github.com/ShaikhZaid404/azuron' }
 /** Two finished runs and one about to finish: the third success is the qualifying moment. */
 const SEED = [run('a', 'done'), run('b', 'review'), run('c', 'running')]
 const THIRD_DONE = [run('a', 'done'), run('b', 'review'), run('c', 'done')]
@@ -49,7 +49,7 @@ function mount(starCount: StarCountPayload | undefined = AVAILABLE, seed: RunRec
   const client = createQueryClient()
   clients.push(client)
   client.setQueryData(workspaceQueryKeys.config, {
-    branding: { name: 'cezar', logoUrl: null },
+    branding: { name: 'AZURON', logoUrl: null },
   })
   if (starCount) client.setQueryData(workspaceQueryKeys.starCount, starCount)
   client.setQueryData(queryKeys.runs.list(), seed)
@@ -109,10 +109,10 @@ describe('StarPromo', () => {
     expect(dialog()).toBeNull() // never under a click in flight
     settle()
     expect(dialog()).not.toBeNull()
-    expect(screen.getByRole('heading', { name: 'Is cezar pulling its weight?' })).toBeTruthy()
+    expect(screen.getByRole('heading', { name: 'Is AZURON pulling its weight?' })).toBeTruthy()
     expect(screen.getByText(/1\.2k stars on GitHub/)).toBeTruthy()
-    expect(screen.getByRole('link', { name: /Star cezar on GitHub/ }).getAttribute('href')).toBe(
-      'https://github.com/open-mercato/cezar',
+    expect(screen.getByRole('link', { name: /Star AZURON on GitHub/ }).getAttribute('href')).toBe(
+      'https://github.com/ShaikhZaid404/azuron',
     )
     expect(record()).toMatchObject({ asks: 1 })
   })
@@ -223,7 +223,7 @@ describe('StarPromo', () => {
     touch()
     patch(THIRD_DONE)
     settle()
-    act(() => fireEvent.click(screen.getByRole('link', { name: /Star cezar on GitHub/ })))
+    act(() => fireEvent.click(screen.getByRole('link', { name: /Star AZURON on GitHub/ })))
     expect(record()).toMatchObject({ outcome: 'starred' })
     expect(dialog()).toBeNull()
   })
@@ -236,7 +236,7 @@ describe('StarPromo', () => {
     touch()
     patch(THIRD_DONE)
     settle()
-    expect(screen.getByText('Your last 30 days with cezar')).toBeTruthy()
+    expect(screen.getByText('Your last 30 days with AZURON')).toBeTruthy()
     expect(screen.getByText('23')).toBeTruthy()
     expect(screen.getByText('+966')).toBeTruthy()
   })

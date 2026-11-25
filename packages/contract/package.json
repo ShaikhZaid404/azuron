@@ -1,7 +1,13 @@
 {
   "name": "@open-mercato/cezar-contract",
   "version": "0.21.0",
-  "description": "The cezar HTTP API contract: zod schemas and the types inferred from them.",
+  "description": "AZURON HTTP API contract: zod schemas and inferred types.",
+  "author": "ShaikhZaid404",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ShaikhZaid404/azuron",
+    "directory": "packages/contract"
+  },
   "license": "MIT",
   "type": "module",
   "exports": {

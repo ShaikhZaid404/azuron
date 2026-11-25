@@ -50,5 +50,5 @@ description: House rules the agent should follow in this repo.
     }
   }
   ensureDataGitignore(repoRoot);
-  console.log('\nDone. Start the cockpit with: npx cezar');
+  console.log('\nDone. Start the cockpit with: azuron');
 }

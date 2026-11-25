@@ -5,7 +5,7 @@ import { cn } from '@/lib/utils'
 import { MascotPortrait } from './mascot-portrait'
 
 const MASCOT_NAMES: Record<ManagerMascot, string> = {
-  base: 'Cezar', builder: 'Builder', analyst: 'Analyst', guardian: 'Guardian', dispatcher: 'Dispatcher',
+  base: 'AZURON', builder: 'Builder', analyst: 'Analyst', guardian: 'Guardian', dispatcher: 'Dispatcher',
   reviewer: 'Reviewer', automator: 'Automator', planner: 'Planner', scout: 'Scout',
 }
 

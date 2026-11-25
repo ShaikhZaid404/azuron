@@ -265,7 +265,7 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
   {
     id: 'phones',
     title: 'Connect a phone',
-    description: 'Pair the CezarBot app with this computer through the relay.',
+    description: 'Pair the AZURON mobile app with this computer through the relay.',
     icon: SmartphoneIcon,
     component: PhonesSection,
     scope: 'global',

@@ -14,7 +14,7 @@ const pull = (number: number, updatedAt: string, branch = `feat/${number}`): Ope
   branch,
   draft: false,
   updatedAt,
-  url: `https://github.com/open-mercato/cezar/pull/${number}`,
+  url: `https://github.com/ShaikhZaid404/azuron/pull/${number}`,
 });
 
 describe('open pull requests', () => {

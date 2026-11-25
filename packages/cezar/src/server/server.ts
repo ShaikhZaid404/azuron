@@ -4022,7 +4022,7 @@ export function createApp(deps: ServerDeps) {
   // Deliberately UNannotated: contract-parity compares the schema to this inferred shape (#1234).
   const workspaceConfigBody = (config: WorkspaceConfig) => ({
     branding: {
-      name: config.branding.name ?? 'cezar',
+      name: config.branding.name ?? 'AZURON',
       logoUrl: logoAssetUrl(),
     },
     computerName: phonePairing.computerName(),
@@ -4318,7 +4318,7 @@ export function createApp(deps: ServerDeps) {
     capabilities().singleProject
       ? singleProjectRefusal('signing in to GitHub')
       : !capabilities().localHandoff
-        ? { error: 'Sign in to GitHub on the machine hosting cezar: run gh auth login there.' }
+        ? { error: 'Sign in to GitHub on the machine hosting AZURON: run gh auth login there.' }
         : null;
   const githubLoginRoutes = new Hono()
     .post('/github/login', async (c) => {
@@ -5415,10 +5415,10 @@ export function createApp(deps: ServerDeps) {
   const noteTodoStarted = async (dataDir: string, todoId: string, taskId: string): Promise<void> => {
     try {
       if (!(await markStarted(dataDir, todoId, taskId))) {
-        console.warn(`[cezar] inbox entry ${todoId} not marked started (unknown or already started)`);
+        console.warn(`[azuron] inbox entry ${todoId} not marked started (unknown or already started)`);
       }
     } catch (err) {
-      console.warn(`[cezar] could not mark inbox entry ${todoId} started: ${String(err)}`);
+      console.warn(`[azuron] could not mark inbox entry ${todoId} started: ${String(err)}`);
     }
   };
 
@@ -5555,7 +5555,7 @@ export function createApp(deps: ServerDeps) {
       // A manager fallback policy bypasses the project's Automatic fallback setting: only the
       // manager engine's in-process request, which carries this process's token, may set one.
       if (parsed.data.managerAgent && !managerAgentTokenMatches(c.req.header(MANAGER_AGENT_HEADER))) {
-        return c.json({ error: 'managerAgent is set only by a cezar manager' }, 403);
+        return c.json({ error: 'managerAgent is set only by an AZURON manager' }, 403);
       }
       if (agentModelsLocked(repoRoot) && (parsed.data.model?.trim() || parsed.data.reasoningEffort?.trim())) {
         return c.json({ error: AGENT_MODELS_LOCKED_ERROR }, 409);
@@ -5597,7 +5597,7 @@ export function createApp(deps: ServerDeps) {
           return c.json(
             {
               error:
-                'parallel variants need a git repository (each variant runs in its own worktree) — run ×1 here, or start cezar inside a git repo',
+                'parallel variants need a git repository (each variant runs in its own worktree) — run ×1 here, or start azuron inside a git repo',
             },
             400,
           );
@@ -5914,7 +5914,7 @@ export function createApp(deps: ServerDeps) {
 
     .post('/runs/:id/switch-agent', paramZodValidator(runIdParamSchema), jsonZodValidator(switchRunAgentInputSchema), async (c) => {
       if (!managerAgentTokenMatches(c.req.header(MANAGER_AGENT_HEADER))) {
-        return c.json({ error: 'switch-agent is available only to a cezar manager' }, 403);
+        return c.json({ error: 'switch-agent is available only to an AZURON manager' }, 403);
       }
       const { root: repoRoot, store, manager } = c.get('project');
       const { id } = c.req.valid('param');
@@ -8849,7 +8849,7 @@ export function createApp(deps: ServerDeps) {
     refusal: () => {
       const caps = capabilities();
       if (caps.singleProject) return 'This workspace runs one fixed project, so agents are set up on the host.';
-      if (!caps.localHandoff) return 'Set up agents on the machine hosting cezar.';
+      if (!caps.localHandoff) return 'Set up agents on the machine hosting AZURON.';
       return terminalPolicyRefusal(caps);
     },
     status: () => providerAuth.status({ refresh: true }),
@@ -9907,7 +9907,7 @@ export function startServer(deps: ServerDeps, port: number): ServerType & { shut
   // one line below and the boot folder's automations would silently stop being
   // scheduled while the cockpit kept showing them enabled. Registered or not,
   // pinning is the same statement: this process is serving that project.
-  const warnAutomations = (message: string) => console.warn(`[cezar] ${message}`);
+  const warnAutomations = (message: string) => console.warn(`[azuron] ${message}`);
   const automationCoordinator = new AutomationCoordinator({ listProjects, pinned: bootProjectId, warn: warnAutomations });
   const bootAutomationStore = automationCoordinator.store(bootProjectId, deps.repoRoot)!;
   const sharedContexts = deps.contexts ?? new ProjectContexts({

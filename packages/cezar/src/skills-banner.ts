@@ -18,7 +18,7 @@ import { readUiState } from './ui-state.ts';
  * degrades to showing the banner, never to a crash or a blocked startup.
  */
 export const SKILLS_BANNER_LINES: readonly string[] = [
-  '  🤖 Make the most of parallel coding with our AI skills',
+  '  [SKILLS] Make the most of parallel coding with our AI skills',
   '  open-mercato/skills: reusable, technology-agnostic agent skills for PR',
   '  creation, code review, CI stabilisation, spec writing & more.',
   '  cezar already loads them for you — Skills → Refresh in the cockpit gets the latest.',
@@ -52,7 +52,7 @@ export async function printSkillsBanner(
  * `serve` is exactly where a promo turns into a nag, so it gets a sentence and no repeat.
  */
 export const STAR_BANNER_LINE =
-  '  ⭐ Find cezar useful? A star helps others find it: https://github.com/open-mercato/cezar';
+  '  [STAR] Find AZURON useful? A star helps: https://github.com/ShaikhZaid404/azuron';
 
 /**
  * The star line, printed after the skills promo on `serve`.

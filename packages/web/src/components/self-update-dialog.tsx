@@ -40,7 +40,7 @@ export function SelfUpdateDialog({
   open,
   onOpenChange,
   autoApply,
-  brandName = 'cezar',
+  brandName = 'AZURON',
 }: {
   open: boolean
   onOpenChange: (open: boolean) => void
@@ -204,7 +204,7 @@ const CHANNELS: { value: UpdateChannel; label: string }[] = [
 const CHANNEL_HINTS: Record<UpdateChannel, string> = {
   stable: 'Tagged releases.',
   nightly: 'A fresh build of main every night.',
-  development: 'A cezar worktree or an open pull request. Never updates on its own.',
+  development: 'An AZURON worktree or an open pull request. Never updates on its own.',
 }
 
 function ChannelToggle({
@@ -490,12 +490,12 @@ function InstallHint({ data }: { data: SelfUpdateStatus }) {
     data.installKind === 'checkout'
       ? 'node packages/cezar/dist/index.js install'
       : data.installKind === 'global-npm'
-        ? 'cezar install'
-        : 'npx cezar-cli install'
+        ? 'azuron install'
+        : 'npx azuron install'
   return (
     <div data-slot="self-update-install-hint" className="rounded-md border border-border bg-muted/40 px-3 py-2.5 text-label">
       <p>{data.reason}</p>
-      <p className="mt-1.5 text-muted-foreground">Run this once, then start cezar with the plain command:</p>
+      <p className="mt-1.5 text-muted-foreground">Run this once, then start azuron with the plain command:</p>
       <pre className="mt-1.5 overflow-x-auto rounded bg-background px-2 py-1.5 font-mono text-label">{command}</pre>
     </div>
   )

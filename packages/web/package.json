@@ -1,7 +1,13 @@
 {
   "name": "@open-mercato/cezar-web",
   "version": "0.21.0",
-  "description": "The cezar cockpit SPA — one client of the cezar API service.",
+  "description": "AZURON cockpit SPA — web interface for AZURON.",
+  "author": "ShaikhZaid404",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ShaikhZaid404/azuron",
+    "directory": "packages/web"
+  },
   "license": "MIT",
   "private": true,
   "type": "module",

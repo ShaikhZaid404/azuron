@@ -78,7 +78,7 @@ function ApprovalDialog({ pairing, onDecide, deciding }: { pairing: PhonePairing
           {pairing.phone?.name} ({pairing.phone?.platform}), as reported by the phone
         </p>
         <p className="text-sm text-muted-foreground">
-          Approve only if you scanned or typed this inside the CezarBot app, on your own phone.
+          Approve only if you scanned or typed this inside the AZURON app, on your own phone.
         </p>
         <AlertDialogFooter>
           <AlertDialogCancel disabled={deciding} onClick={() => onDecide(false)}>Deny</AlertDialogCancel>
@@ -224,7 +224,7 @@ export function PhonesSection() {
       <section aria-labelledby="connect-phone" className="space-y-3">
         <h2 id="connect-phone" className="text-sm font-medium">Connect a phone</h2>
         <ol className="space-y-5">
-          <Step n={1} title="Get the CezarBot app">
+          <Step n={1} title="Get the AZURON app">
             <GetTheApp />
           </Step>
           <Step n={2} title="Your email and the terms" id="phone-step-email">
@@ -243,11 +243,11 @@ export function PhonesSection() {
             {showing ? (
               <div className="flex flex-col gap-4 sm:flex-row sm:items-start">
                 <figure className="space-y-2">
-                  <figcaption className="text-sm font-medium">Scan in the CezarBot app</figcaption>
-                  <QrSvg value={credentials.qr} label="Pairing QR code: scan it in the CezarBot app" className="size-56" />
+                  <figcaption className="text-sm font-medium">Scan in the AZURON app</figcaption>
+                  <QrSvg value={credentials.qr} label="Pairing QR code: scan it in the AZURON app" className="size-56" />
                 </figure>
                 <div className="space-y-2 text-sm sm:pt-7">
-                  <p>Open the CezarBot app and scan this there, not with your camera app.</p>
+                  <p>Open the AZURON app and scan this there, not with your camera app.</p>
                   <p className="text-muted-foreground" aria-live="off">Expires in {clock(seconds)}</p>
                   {code ? (
                     <dl className="space-y-1">
@@ -273,11 +273,11 @@ export function PhonesSection() {
                   The relay is end-to-end encrypted, so it cannot read prompts, code or keys. It does see IP addresses and the timing and volume of traffic.
                 </p>
                 <p className="text-sm text-muted-foreground">
-                  Scan the code inside the CezarBot app. A camera app cannot use it, and it is a secret, so do not copy or search for what a camera shows.
+                  Scan the code inside the AZURON app. A camera app cannot use it, and it is a secret, so do not copy or search for what a camera shows.
                 </p>
                 {badRelay ? (
                   <p role="alert" className="text-sm text-destructive">
-                    <code>CEZ_RELAY_URL</code> is not a valid relay address. Fix or unset it, then restart cezar.
+                    <code>CEZ_RELAY_URL</code> is not a valid relay address. Fix or unset it, then restart azuron.
                   </p>
                 ) : null}
                 <Button disabled={start.isPending || badRelay || !accountReady} onClick={() => start.mutate()}>

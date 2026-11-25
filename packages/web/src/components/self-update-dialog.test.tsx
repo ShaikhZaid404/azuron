@@ -87,7 +87,7 @@ const development: SelfUpdateDevelopment = {
   ],
   pulls: {
     available: true,
-    repo: 'open-mercato/cezar',
+    repo: 'ShaikhZaid404/azuron',
     items: [
       {
         number: 1169,
@@ -96,7 +96,7 @@ const development: SelfUpdateDevelopment = {
         branch: 'feat/landing-check-ui',
         draft: false,
         updatedAt: '2026-09-29T13:42:23Z',
-        url: 'https://github.com/open-mercato/cezar/pull/1169',
+        url: 'https://github.com/ShaikhZaid404/azuron/pull/1169',
         version: '0.13.0-pr1169.1300',
         publishedAt: '2026-09-29T13:50:00Z',
         installed: false,
@@ -108,7 +108,7 @@ const development: SelfUpdateDevelopment = {
         branch: 'feat/outbound-pii-guard',
         draft: true,
         updatedAt: '2026-09-29T08:33:23Z',
-        url: 'https://github.com/open-mercato/cezar/pull/1160',
+        url: 'https://github.com/ShaikhZaid404/azuron/pull/1160',
         version: null,
         publishedAt: null,
         installed: false,

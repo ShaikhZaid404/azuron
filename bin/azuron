@@ -29,7 +29,7 @@ function getRunningPid() {
 
 async function isPortInUse() {
   try {
-    const res = await fetch(`${URL}/api/health`, { signal: AbortSignal.timeout(800) });
+    const res = await fetch(`${URL}/api/v1/health`, { signal: AbortSignal.timeout(800) });
     return res.ok;
   } catch {
     return false;
@@ -92,9 +92,9 @@ async function cmdStatus() {
     return;
   }
   try {
-    const res = await fetch(`${URL}/api/health`);
+    const res = await fetch(`${URL}/api/v1/health`);
     const json = await res.json();
-    console.log(`[CHECK] Status: Running (PID ${pid}) | ${URL} | RAM: ${json.memoryMb} MB | Uptime: ${json.uptimeSec}s`);
+    console.log(`[CHECK] Status: Running (PID ${pid}) | ${URL} | Version: ${json.version ?? VERSION}`);
   } catch {
     console.log(`[WARN] Process alive (PID ${pid}) but HTTP health unreachable at ${URL}`);
   }

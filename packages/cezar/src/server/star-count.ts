@@ -25,8 +25,9 @@ import { z } from 'zod';
  * flicker.
  */
 
-const REPO = 'open-mercato/cezar';
+const REPO = 'ShaikhZaid404/azuron';
 export const CEZAR_REPO_URL = `https://github.com/${REPO}`;
+export const AZURON_REPO_URL = CEZAR_REPO_URL;
 const API_URL = `https://api.github.com/repos/${REPO}`;
 const TIMEOUT_MS = 5_000;
 /** Fifteen minutes — the most often cezar asks github.com. The cockpit has no timer of its own: it

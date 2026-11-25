@@ -43,6 +43,10 @@
     "android",
     "local-first"
   ],
-  "author": "AZURON Team (based on Cezar by open-mercato)",
+  "author": "ShaikhZaid404",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ShaikhZaid404/azuron.git"
+  },
   "license": "MIT"
 }

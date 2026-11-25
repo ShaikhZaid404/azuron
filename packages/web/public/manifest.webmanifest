@@ -1,8 +1,8 @@
 {
   "id": "/",
-  "name": "cezar",
-  "short_name": "cezar",
-  "description": "Run and track parallel coding-agent tasks.",
+  "name": "AZURON",
+  "short_name": "AZURON",
+  "description": "AZURON — Local-First AI Coding Agent Workspace",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",

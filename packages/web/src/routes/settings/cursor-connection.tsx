@@ -23,11 +23,11 @@ export function CursorConnection({ status, installCommand }: { status: ProviderS
       <p>
         Use your Cursor account with the local Cursor Agent CLI. Sign in with the same account you
         use at <a className="underline" href="https://cursor.com/agents" target="_blank" rel="noreferrer">cursor.com/agents</a>, then Verify connection.
-        Cezar runs Cursor in this project's local worktree; attaching or listing existing Cloud Agent sessions is not supported here.
+        AZURON runs Cursor in this project's local worktree; attaching or listing existing Cloud Agent sessions is not supported here.
       </p>
       {missing ? (
         <p>
-          Install Cursor CLI on the machine running Cezar: <code className="select-all break-all">{installCommand}</code>.
+          Install Cursor CLI on the machine running AZURON: <code className="select-all break-all">{installCommand}</code>.
           Then Verify connection and sign in. <a className="underline" href="https://cursor.com/docs/cli/installation" target="_blank" rel="noreferrer">Installation help</a>
         </p>
       ) : (
@@ -55,7 +55,7 @@ export function CursorConnection({ status, installCommand }: { status: ProviderS
               {connect.isPending ? 'Opening sign-in…' : connected ? 'Sign in again' : 'Connect Cursor account'}
             </Button>
           ) : (
-            <p>Sign in on the machine hosting Cezar with <code className="select-all">agent login</code>, then Verify connection.</p>
+            <p>Sign in on the machine hosting AZURON with <code className="select-all">agent login</code>, then Verify connection.</p>
           )}
           <a className="underline" href="https://cursor.com/docs/cli/reference/authentication" target="_blank" rel="noreferrer">Sign-in help</a>
         </div>
@@ -68,13 +68,13 @@ export function CursorConnection({ status, installCommand }: { status: ProviderS
       ) : null}
       <p className="text-muted-foreground">
         A browser session alone does not sign in the CLI. You can also use a Cursor user API key via
-        CURSOR_API_KEY in Cezar's environment. Cezar cannot import browser cookies or store a Cursor API key here.
+        CURSOR_API_KEY in AZURON's environment. AZURON cannot import browser cookies or store a Cursor API key here.
       </p>
       {connected ? (
         <div data-slot="cursor-models" className="flex flex-col gap-2 border-t border-border/60 pt-2">
           <p className="font-medium">Cursor models</p>
           {models.isPending ? <p>Loading models from Cursor CLI…</p> : models.isError || models.data?.source === 'unavailable' || !models.data?.models.length ? (
-            <p role="status">Models could not be verified. Run <code>agent models</code> on the machine running Cezar to check account access, then Verify connection to retry.</p>
+            <p role="status">Models could not be verified. Run <code>agent models</code> on the machine running AZURON to check account access, then Verify connection to retry.</p>
           ) : (
             <>
               {models.data.stale ? <p role="status">Showing previously discovered models. Verify connection to retry Cursor.</p> : null}

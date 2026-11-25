@@ -113,7 +113,7 @@ describe('printStarBanner', () => {
     await printStarBanner(repoRoot, log);
     const text = printed.join('\n');
     expect(text).toContain('star');
-    expect(text).toContain('https://github.com/open-mercato/cezar');
+    expect(text).toContain('https://github.com/ShaikhZaid404/azuron');
   });
 
   it('is exactly one line — plus the blank that separates the block from what follows', async () => {
@@ -143,7 +143,7 @@ describe('printStarBanner', () => {
   it('prints when ui-state.json is missing or malformed — degrades to shown, never throws', async () => {
     writeUiState('{not json');
     await printStarBanner(repoRoot, log);
-    expect(printed.join('\n')).toContain('github.com/open-mercato/cezar');
+    expect(printed.join('\n')).toContain('github.com/ShaikhZaid404/azuron');
   });
 
   it('emits no ANSI escapes', () => {

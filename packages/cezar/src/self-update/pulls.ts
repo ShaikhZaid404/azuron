@@ -17,8 +17,9 @@ import { z } from 'zod';
 
 const exec = promisify(execFile);
 
-/** The repository cezar's own releases and previews are cut from. */
-export const CEZAR_REPO = 'open-mercato/cezar';
+/** The repository AZURON's own releases and previews are cut from. */
+export const AZURON_REPO = 'ShaikhZaid404/azuron';
+export const CEZAR_REPO = AZURON_REPO;
 
 const TIMEOUT_MS = 15_000;
 const CACHE_TTL_MS = 2 * 60_000;
