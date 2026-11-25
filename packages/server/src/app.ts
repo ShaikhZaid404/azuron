@@ -48,7 +48,7 @@ export function createAzuronApp(opts?: {
   const workflows = new AzuronWorkflowEngine(hub);
   const backup = new AzuronCloudBackupService(paths);
 
-  const workspaceRoot = opts?.workspaceRoot || path.resolve(import.meta.dirname, '../../../..');
+  const workspaceRoot = opts?.workspaceRoot || path.resolve(import.meta.dirname, '../../..');
   const services: AzuronServices = {
     paths,
     logger,
